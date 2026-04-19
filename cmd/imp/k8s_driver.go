@@ -30,8 +30,9 @@ type handleJob struct {
 }
 
 // DriverK8s implements driver.Driver using the Kubernetes batch/v1 Job API.
-// Kueue integration: every Job is created with suspend=true and the
-// kueue.x-k8s.io/queue-name label so Kueue controls admission.
+// Kueue integration is optional: if the queue-name label is present, the Job
+// starts suspended so Kueue can admit it; otherwise it starts immediately as a
+// plain Kubernetes Job.
 type DriverK8s struct {
 	driver.BaseDriver
 	ns        string
@@ -150,9 +151,9 @@ func (d *DriverK8s) Cancel(ctx context.Context, h driver.Handle) error {
 }
 
 // buildJob constructs a batchv1.Job from a RunSpec.
-// Key PoC behaviours:
-//   - suspend: true  — Kueue manages admission
-//   - kueue.x-k8s.io/queue-name label — taken from spec.Labels if present
+// Key behaviours:
+//   - suspend: true only when kueue.x-k8s.io/queue-name is present
+//   - plain Kubernetes Jobs start unsuspended by default
 //   - PVC volumes — each Mount.Source is treated as a PVC claim name
 func buildJob(spec api.RunSpec, ns string) *batchv1.Job {
 	jobName := sanitizeName(spec.RunID)
@@ -183,7 +184,8 @@ func buildJob(spec api.RunSpec, ns string) *batchv1.Job {
 	volumes, volumeMounts := buildVolumes(spec.Mounts)
 	container.VolumeMounts = volumeMounts
 
-	suspend := true
+	_, useKueue := labels["kueue.x-k8s.io/queue-name"]
+	suspend := useKueue
 	backoffLimit := int32(0) // PoC: no retry; fail immediately on pod failure
 	var ttlSecondsAfterFinished *int32
 	if spec.Cleanup.TTLSecondsAfterFinished > 0 {
