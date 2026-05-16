@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/seoyhaein/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/api"
 )
 
 // Run with:

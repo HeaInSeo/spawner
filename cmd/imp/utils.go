@@ -3,7 +3,7 @@ package imp
 import (
 	"time"
 
-	"github.com/seoyhaein/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/api"
 )
 
 func emitState(s api.EventSink, spawnKey, runID string, st api.State, msg string) {

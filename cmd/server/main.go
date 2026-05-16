@@ -7,16 +7,16 @@ import (
 	"os"
 	"time"
 
-	"github.com/seoyhaein/spawner/cmd/imp"
-	"github.com/seoyhaein/spawner/pkg/actor"
-	"github.com/seoyhaein/spawner/pkg/api"
-	"github.com/seoyhaein/spawner/pkg/dispatcher"
-	"github.com/seoyhaein/spawner/pkg/driver"
-	sErr "github.com/seoyhaein/spawner/pkg/error"
-	"github.com/seoyhaein/spawner/pkg/factory"
-	fdr "github.com/seoyhaein/spawner/pkg/frontdoor"
-	ply "github.com/seoyhaein/spawner/pkg/policy"
-	"github.com/seoyhaein/spawner/pkg/store"
+	"github.com/HeaInSeo/spawner/cmd/imp"
+	"github.com/HeaInSeo/spawner/pkg/actor"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/dispatcher"
+	"github.com/HeaInSeo/spawner/pkg/driver"
+	sErr "github.com/HeaInSeo/spawner/pkg/error"
+	"github.com/HeaInSeo/spawner/pkg/factory"
+	fdr "github.com/HeaInSeo/spawner/pkg/frontdoor"
+	ply "github.com/HeaInSeo/spawner/pkg/policy"
+	"github.com/HeaInSeo/spawner/pkg/store"
 )
 
 const defaultRunStorePath = "/tmp/spawner-runstore.json"
@@ -45,14 +45,18 @@ func runStorePath(getenv func(string) string) string {
 func sampleInput() fdr.ResolveInput {
 	return fdr.ResolveInput{
 		Req: &api.RunSpec{
-			RunID:    "run-001",
-			ImageRef: "ghcr.io/acme/tool@sha256:deadbeef...",
-			Env:      map[string]string{"SAMPLE_ID": "HG001"},
+			SpecVersion: 1,
+			RunID:       "run-001",
+			ImageRef:    "ghcr.io/acme/tool@sha256:deadbeef...",
+			Env:         map[string]string{"SAMPLE_ID": "HG001"},
+			Annotations: map[string]string{"example.com/pipeline": "genomics"},
 			Mounts: []api.Mount{
 				{Source: "/data/HG001", Target: "/in", ReadOnly: true},
 				{Source: "workvol", Target: "/work", ReadOnly: false},
 			},
-			Resources: api.Resources{CPU: "2", Memory: "4Gi"},
+			Resources:     api.Resources{CPU: "2", Memory: "4Gi"},
+			CorrelationID: "sample-HG001",
+			Cleanup:       api.CleanupPolicy{TTLSecondsAfterFinished: 900},
 		},
 		Meta: fdr.MetaContext{
 			RPC:       "RunE",

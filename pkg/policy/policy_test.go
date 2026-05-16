@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/seoyhaein/spawner/pkg/policy"
+	"github.com/HeaInSeo/spawner/pkg/policy"
 )
 
 func TestDefaultAttemptPolicy_MatchesFastFailRecoveryDefaults(t *testing.T) {

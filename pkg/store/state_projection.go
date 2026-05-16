@@ -1,6 +1,6 @@
 package store
 
-import "github.com/seoyhaein/spawner/pkg/api"
+import "github.com/HeaInSeo/spawner/pkg/api"
 
 // StateProjection describes how a persisted RunState should be interpreted
 // at the operator-facing event layer.

@@ -3,7 +3,7 @@ package actor
 import (
 	"context"
 
-	"github.com/seoyhaein/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/api"
 )
 
 type Actor interface {

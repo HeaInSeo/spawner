@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/seoyhaein/spawner/pkg/api"
-	"github.com/seoyhaein/spawner/pkg/driver"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/driver"
 )
 
 type testPrepared struct{ driver.BasePrepared }

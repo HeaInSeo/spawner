@@ -12,8 +12,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/seoyhaein/spawner/pkg/api"
-	"github.com/seoyhaein/spawner/pkg/driver"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/driver"
 )
 
 // preparedJob holds the K8s Job object built during Prepare.
@@ -176,6 +176,7 @@ func buildJob(spec api.RunSpec, ns string) *batchv1.Job {
 		Name:            "main",
 		Image:           spec.ImageRef,
 		Command:         spec.Command,
+		WorkingDir:      spec.WorkingDir,
 		Env:             buildEnvVars(spec.Env, spec.EnvFieldRefs),
 		Resources:       buildResources(spec.Resources),
 		ImagePullPolicy: corev1.PullIfNotPresent,
@@ -209,10 +210,11 @@ func buildJob(spec api.RunSpec, ns string) *batchv1.Job {
 					Annotations: annotations,
 				},
 				Spec: corev1.PodSpec{
-					RestartPolicy: corev1.RestartPolicyNever,
-					Containers:    []corev1.Container{container},
-					Volumes:       volumes,
-					NodeSelector:  buildNodeSelector(spec.Placement),
+					ServiceAccountName: spec.ServiceAccountName,
+					RestartPolicy:      corev1.RestartPolicyNever,
+					Containers:         []corev1.Container{container},
+					Volumes:            volumes,
+					NodeSelector:       buildNodeSelector(spec.Placement),
 				},
 			},
 		},

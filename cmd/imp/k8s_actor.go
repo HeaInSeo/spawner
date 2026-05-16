@@ -6,9 +6,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/seoyhaein/spawner/pkg/actor"
-	"github.com/seoyhaein/spawner/pkg/api"
-	"github.com/seoyhaein/spawner/pkg/driver"
+	"github.com/HeaInSeo/spawner/pkg/actor"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/driver"
 )
 
 // K8sActor can run multiple runIDs concurrently within the same actor.

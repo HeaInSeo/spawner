@@ -3,7 +3,7 @@ package dispatcher
 import (
 	"time"
 
-	"github.com/seoyhaein/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/api"
 )
 
 type NoopSink struct{}

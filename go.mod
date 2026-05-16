@@ -1,4 +1,4 @@
-module github.com/seoyhaein/spawner
+module github.com/HeaInSeo/spawner
 
 go 1.25.5
 

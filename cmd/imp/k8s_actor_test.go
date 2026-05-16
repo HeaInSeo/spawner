@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/seoyhaein/spawner/pkg/api"
-	"github.com/seoyhaein/spawner/pkg/driver"
-	"github.com/seoyhaein/spawner/pkg/policy"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/driver"
+	"github.com/HeaInSeo/spawner/pkg/policy"
 )
 
 type actorTestSink struct {

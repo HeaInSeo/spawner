@@ -3,8 +3,8 @@ package factory
 import (
 	"sync"
 
-	"github.com/seoyhaein/spawner/pkg/actor"
-	"github.com/seoyhaein/spawner/pkg/driver"
+	"github.com/HeaInSeo/spawner/pkg/actor"
+	"github.com/HeaInSeo/spawner/pkg/driver"
 )
 
 // Factory supports both:

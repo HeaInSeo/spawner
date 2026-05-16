@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/seoyhaein/spawner/pkg/api"
-	"github.com/seoyhaein/spawner/pkg/dispatcher"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/dispatcher"
 )
 
 func TestBufferedSink_TrySendDoesNotBlockWhenBufferFull(t *testing.T) {
