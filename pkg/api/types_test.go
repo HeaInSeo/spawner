@@ -5,19 +5,42 @@ import (
 	"testing"
 	"time"
 
-	"github.com/seoyhaein/spawner/pkg/api"
-	sErr "github.com/seoyhaein/spawner/pkg/error"
-	"github.com/seoyhaein/spawner/pkg/policy"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	sErr "github.com/HeaInSeo/spawner/pkg/error"
+	"github.com/HeaInSeo/spawner/pkg/policy"
 )
 
 func TestRunSpecValidate(t *testing.T) {
-	valid := api.RunSpec{RunID: "run-1", ImageRef: "busybox:1.36"}
+	valid := api.RunSpec{
+		SpecVersion:   1,
+		RunID:         "run-1",
+		ImageRef:      "busybox:1.36",
+		Annotations:   map[string]string{"team": "genomics"},
+		CorrelationID: "sample-001",
+		Cleanup:       api.CleanupPolicy{TTLSecondsAfterFinished: 300},
+	}
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("expected valid spec, got %v", err)
 	}
 
 	if err := (api.RunSpec{}).Validate(); !errors.Is(err, sErr.ErrInvalidCommand) {
 		t.Fatalf("expected ErrInvalidCommand for empty spec, got %v", err)
+	}
+
+	if err := (api.RunSpec{
+		RunID:    "run-1",
+		ImageRef: "busybox:1.36",
+		Mounts:   []api.Mount{{Source: "", Target: "/data"}},
+	}).Validate(); !errors.Is(err, sErr.ErrInvalidCommand) {
+		t.Fatalf("expected ErrInvalidCommand for invalid mount, got %v", err)
+	}
+
+	if err := (api.RunSpec{
+		RunID:    "run-1",
+		ImageRef: "busybox:1.36",
+		Cleanup:  api.CleanupPolicy{TTLSecondsAfterFinished: -1},
+	}).Validate(); !errors.Is(err, sErr.ErrInvalidCommand) {
+		t.Fatalf("expected ErrInvalidCommand for invalid cleanup ttl, got %v", err)
 	}
 }
 

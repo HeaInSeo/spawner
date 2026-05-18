@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/seoyhaein/spawner/pkg/actor"
+	"github.com/HeaInSeo/spawner/pkg/actor"
 )
 
 func TestMailbox_TryEnqueueAndReceive(t *testing.T) {

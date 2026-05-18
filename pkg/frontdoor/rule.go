@@ -3,8 +3,8 @@ package frontdoor
 import (
 	"strings"
 
-	"github.com/seoyhaein/spawner/pkg/api"
-	"github.com/seoyhaein/spawner/pkg/policy"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/policy"
 )
 
 type Rule struct {

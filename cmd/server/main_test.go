@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/seoyhaein/spawner/pkg/api"
-	"github.com/seoyhaein/spawner/pkg/dispatcher"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/dispatcher"
 )
 
 func TestRunStorePath_DefaultsToTmp(t *testing.T) {
@@ -37,6 +37,18 @@ func TestSampleInput_BuildsExpectedRunSpec(t *testing.T) {
 	}
 	if rs.ImageRef == "" || len(rs.Mounts) != 2 {
 		t.Fatalf("expected populated sample input, got image=%q mounts=%d", rs.ImageRef, len(rs.Mounts))
+	}
+	if rs.SpecVersion != 1 {
+		t.Fatalf("expected spec version 1, got %d", rs.SpecVersion)
+	}
+	if rs.Annotations["example.com/pipeline"] != "genomics" {
+		t.Fatalf("unexpected annotation set: %+v", rs.Annotations)
+	}
+	if rs.CorrelationID != "sample-HG001" {
+		t.Fatalf("unexpected correlation id: %q", rs.CorrelationID)
+	}
+	if rs.Cleanup.TTLSecondsAfterFinished != 900 {
+		t.Fatalf("unexpected cleanup ttl: %d", rs.Cleanup.TTLSecondsAfterFinished)
 	}
 	if in.Meta.RPC != "RunE" || in.Meta.TenantID != "teamA" {
 		t.Fatalf("unexpected meta: %+v", in.Meta)

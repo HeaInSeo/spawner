@@ -8,13 +8,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/seoyhaein/spawner/pkg/actor"
-	"github.com/seoyhaein/spawner/pkg/api"
-	"github.com/seoyhaein/spawner/pkg/dispatcher"
-	sErr "github.com/seoyhaein/spawner/pkg/error"
-	"github.com/seoyhaein/spawner/pkg/frontdoor"
-	"github.com/seoyhaein/spawner/pkg/policy"
-	"github.com/seoyhaein/spawner/pkg/store"
+	"github.com/HeaInSeo/spawner/pkg/actor"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/dispatcher"
+	sErr "github.com/HeaInSeo/spawner/pkg/error"
+	"github.com/HeaInSeo/spawner/pkg/frontdoor"
+	"github.com/HeaInSeo/spawner/pkg/policy"
+	"github.com/HeaInSeo/spawner/pkg/store"
 )
 
 // ── mocks ─────────────────────────────────────────────────────────────────────

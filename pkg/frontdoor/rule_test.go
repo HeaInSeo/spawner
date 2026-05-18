@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/seoyhaein/spawner/pkg/api"
-	sErr "github.com/seoyhaein/spawner/pkg/error"
-	"github.com/seoyhaein/spawner/pkg/frontdoor"
-	"github.com/seoyhaein/spawner/pkg/policy"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	sErr "github.com/HeaInSeo/spawner/pkg/error"
+	"github.com/HeaInSeo/spawner/pkg/frontdoor"
+	"github.com/HeaInSeo/spawner/pkg/policy"
 )
 
 func TestPredicates_ComposeAsExpected(t *testing.T) {

@@ -4,10 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/seoyhaein/spawner/pkg/actor"
-	"github.com/seoyhaein/spawner/pkg/api"
-	"github.com/seoyhaein/spawner/pkg/driver"
-	"github.com/seoyhaein/spawner/pkg/factory"
+	"github.com/HeaInSeo/spawner/pkg/actor"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/driver"
+	"github.com/HeaInSeo/spawner/pkg/factory"
 )
 
 type testDriver struct{ driver.UnimplementedDriver }

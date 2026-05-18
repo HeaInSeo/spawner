@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/seoyhaein/spawner/pkg/api"
-	sErr "github.com/seoyhaein/spawner/pkg/error"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	sErr "github.com/HeaInSeo/spawner/pkg/error"
 )
 
 type ResolveInput struct {

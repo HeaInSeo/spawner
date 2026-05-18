@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/seoyhaein/spawner/pkg/store"
+	"github.com/HeaInSeo/spawner/pkg/store"
 )
 
 // ── state machine ─────────────────────────────────────────────────────────────

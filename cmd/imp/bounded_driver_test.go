@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/seoyhaein/spawner/cmd/imp"
-	"github.com/seoyhaein/spawner/pkg/api"
-	"github.com/seoyhaein/spawner/pkg/driver"
+	"github.com/HeaInSeo/spawner/cmd/imp"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/driver"
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────────

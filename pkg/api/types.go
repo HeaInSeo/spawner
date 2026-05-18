@@ -4,8 +4,8 @@ import (
 	"strings"
 	"time"
 
-	sErr "github.com/seoyhaein/spawner/pkg/error"
-	ply "github.com/seoyhaein/spawner/pkg/policy"
+	sErr "github.com/HeaInSeo/spawner/pkg/error"
+	ply "github.com/HeaInSeo/spawner/pkg/policy"
 )
 
 type CmdKind int
@@ -94,19 +94,21 @@ func (c Command) Validate() error {
 }
 
 type RunSpec struct {
-	SpecVersion   int
-	RunID         string
-	ImageRef      string // digest-locked preferred
-	Command       []string
-	Env           map[string]string
-	EnvFieldRefs  map[string]string
-	Labels        map[string]string // K8s labels; kueue.x-k8s.io/queue-name goes here
-	Annotations   map[string]string
-	Mounts        []Mount
-	Resources     Resources
-	CorrelationID string
-	Cleanup       CleanupPolicy
-	Placement     *Placement
+	SpecVersion        int
+	RunID              string
+	ImageRef           string // digest-locked preferred
+	Command            []string
+	WorkingDir         string
+	Env                map[string]string
+	EnvFieldRefs       map[string]string
+	Labels             map[string]string // K8s labels; kueue.x-k8s.io/queue-name goes here
+	Annotations        map[string]string
+	Mounts             []Mount
+	Resources          Resources
+	ServiceAccountName string
+	CorrelationID      string
+	Cleanup            CleanupPolicy
+	Placement          *Placement
 }
 
 func (r RunSpec) Validate() error {

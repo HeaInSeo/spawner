@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/seoyhaein/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/api"
 )
 
 // TODO actor 처럼 하는 게 어떤지 생각해보자.

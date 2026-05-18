@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/seoyhaein/spawner/pkg/api"
-	sErr "github.com/seoyhaein/spawner/pkg/error"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	sErr "github.com/HeaInSeo/spawner/pkg/error"
 )
 
 func TestNopDriver_AlwaysReturnsBackendUnavailable(t *testing.T) {

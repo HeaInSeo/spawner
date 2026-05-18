@@ -1,6 +1,6 @@
-module github.com/seoyhaein/spawner
+module github.com/HeaInSeo/spawner
 
-go 1.25.5
+go 1.25.10
 
 require (
 	k8s.io/api v0.35.3

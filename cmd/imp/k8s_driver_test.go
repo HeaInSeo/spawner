@@ -10,8 +10,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 
-	"github.com/seoyhaein/spawner/pkg/api"
-	"github.com/seoyhaein/spawner/pkg/driver"
+	"github.com/HeaInSeo/spawner/pkg/api"
+	"github.com/HeaInSeo/spawner/pkg/driver"
 )
 
 type testPrepared struct{ driver.BasePrepared }
@@ -35,6 +35,7 @@ func TestBuildJob_MapsSpecFields(t *testing.T) {
 		RunID:       "My.Run_01",
 		ImageRef:    "busybox:1.36",
 		Command:     []string{"sh", "-c", "echo hi"},
+		WorkingDir:  "/workspace",
 		Env: map[string]string{
 			"FOO": "bar",
 		},
@@ -50,10 +51,11 @@ func TestBuildJob_MapsSpecFields(t *testing.T) {
 		Mounts: []api.Mount{
 			{Source: "pvc-a", Target: "/data", ReadOnly: false},
 		},
-		Resources:     api.Resources{CPU: "100m", Memory: "64Mi"},
-		CorrelationID: "sample-001",
-		Cleanup:       api.CleanupPolicy{TTLSecondsAfterFinished: 600},
-		Placement:     &api.Placement{NodeSelector: map[string]string{"kubernetes.io/hostname": "lab-worker-1"}},
+		Resources:          api.Resources{CPU: "100m", Memory: "64Mi"},
+		ServiceAccountName: "jumi-runner",
+		CorrelationID:      "sample-001",
+		Cleanup:            api.CleanupPolicy{TTLSecondsAfterFinished: 600},
+		Placement:          &api.Placement{NodeSelector: map[string]string{"kubernetes.io/hostname": "lab-worker-1"}},
 	}
 
 	job := buildJob(spec, "default")
@@ -92,6 +94,9 @@ func TestBuildJob_MapsSpecFields(t *testing.T) {
 	if c.Image != spec.ImageRef {
 		t.Fatalf("unexpected image: %q", c.Image)
 	}
+	if c.WorkingDir != "/workspace" {
+		t.Fatalf("unexpected working dir: %q", c.WorkingDir)
+	}
 	if got := envValueByName(c.Env, "FOO"); got != "bar" {
 		t.Fatalf("unexpected env value: %q", got)
 	}
@@ -111,6 +116,9 @@ func TestBuildJob_MapsSpecFields(t *testing.T) {
 	}
 	if got := job.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"]; got != "lab-worker-1" {
 		t.Fatalf("unexpected nodeSelector: %q", got)
+	}
+	if got := job.Spec.Template.Spec.ServiceAccountName; got != "jumi-runner" {
+		t.Fatalf("unexpected serviceAccountName: %q", got)
 	}
 	if got := job.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName; got != "pvc-a" {
 		t.Fatalf("unexpected pvc claim: %q", got)
