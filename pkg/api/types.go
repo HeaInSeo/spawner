@@ -112,6 +112,7 @@ type RunSpec struct {
 }
 
 func (r RunSpec) Validate() error {
+	const hostnameLabel = "kubernetes.io/hostname"
 	if r.SpecVersion < 0 {
 		return sErr.ErrInvalidCommand
 	}
@@ -128,6 +129,25 @@ func (r RunSpec) Validate() error {
 	}
 	if r.Cleanup.TTLSecondsAfterFinished < 0 {
 		return sErr.ErrInvalidCommand
+	}
+	if r.Placement != nil {
+		required := strings.TrimSpace(r.Placement.RequiredNodeName)
+		if required != "" && r.Placement.NodeSelector != nil {
+			if hostname := strings.TrimSpace(r.Placement.NodeSelector[hostnameLabel]); hostname != "" && hostname != required {
+				return sErr.ErrInvalidCommand
+			}
+		}
+		if required != "" && len(r.Placement.PreferredNodes) > 0 {
+			return sErr.ErrInvalidCommand
+		}
+		for _, pref := range r.Placement.PreferredNodes {
+			if strings.TrimSpace(pref.NodeName) == "" {
+				return sErr.ErrInvalidCommand
+			}
+			if pref.Weight < 1 || pref.Weight > 100 {
+				return sErr.ErrInvalidCommand
+			}
+		}
 	}
 	return nil
 }
@@ -147,8 +167,15 @@ type Resources struct {
 	Memory string
 }
 
+type WeightedNodePreference struct {
+	NodeName string
+	Weight   int32
+}
+
 type Placement struct {
-	NodeSelector map[string]string
+	NodeSelector     map[string]string
+	RequiredNodeName string
+	PreferredNodes   []WeightedNodePreference
 }
 
 type RunIdentity struct {

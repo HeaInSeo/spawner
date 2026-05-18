@@ -174,6 +174,17 @@ Important, but intentionally outside these residual sprints:
 - `DriverK8s.Wait()` polling -> watch/informer migration
 - real Kueue/cluster integration hardening
 - deployment, HA, and observability pipeline automation
+- init-container / shared-volume materialization surfaces
+- generic acquisition contract injection
+
+## Current Placement Note
+
+As of the current library surface:
+
+- `RequiredNodeName` is supported as a hard placement constraint via `kubernetes.io/hostname`
+- `PreferredNodes` is supported as a soft placement hint via Kubernetes preferred node affinity
+- this does not imply storage/materialization semantics
+- `MaterializationPlan` remains a downstream design concern and is intentionally not modeled by `spawner` yet
 
 ## Effort Estimate
 

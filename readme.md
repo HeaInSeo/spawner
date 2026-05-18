@@ -70,6 +70,21 @@ The repository now includes direct tests for:
 - `pkg/factory` actor reuse via `Bind/Register/Unbind`
 - `pkg/frontdoor` predicate composition and cancel-rule construction
 
+## Placement Surface
+
+Current `RunSpec.Placement` semantics are intentionally narrow.
+
+- `NodeSelector`: direct hard constraint passthrough
+- `RequiredNodeName`: mapped to `kubernetes.io/hostname` nodeSelector
+- `PreferredNodes`: mapped to Kubernetes `nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution`
+
+Important notes:
+
+- `RequiredNodeName` is a hard placement constraint.
+- `PreferredNodes` are soft hints only. The Kubernetes scheduler is not required to honor them.
+- `RequiredNodeName` and `PreferredNodes` must not be used together in the current v0 surface.
+- `MaterializationPlan`, init-container wiring, shared-volume acquisition, and generic PodSpec extension are intentionally deferred.
+
 Coverage snapshot:
 
 - Overall statement coverage: `75.5%`

@@ -117,6 +117,9 @@ func TestBuildJob_MapsSpecFields(t *testing.T) {
 	if got := job.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"]; got != "lab-worker-1" {
 		t.Fatalf("unexpected nodeSelector: %q", got)
 	}
+	if job.Spec.Template.Spec.Affinity != nil {
+		t.Fatal("expected no affinity for plain nodeSelector placement")
+	}
 	if got := job.Spec.Template.Spec.ServiceAccountName; got != "jumi-runner" {
 		t.Fatalf("unexpected serviceAccountName: %q", got)
 	}
@@ -128,6 +131,60 @@ func TestBuildJob_MapsSpecFields(t *testing.T) {
 	}
 	if got := job.Spec.Template.Annotations["spawner.correlation-id"]; got != "sample-001" {
 		t.Fatalf("expected template correlation annotation, got %q", got)
+	}
+}
+
+func TestBuildJob_MapsRequiredPlacementToHostnameSelector(t *testing.T) {
+	spec := api.RunSpec{
+		SpecVersion: 1,
+		RunID:       "run-required-placement",
+		ImageRef:    "busybox:1.36",
+		Command:     []string{"sh", "-c", "echo hi"},
+		Placement:   &api.Placement{RequiredNodeName: "lab-worker-2"},
+	}
+
+	job := buildJob(spec, "default")
+
+	if got := job.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"]; got != "lab-worker-2" {
+		t.Fatalf("required placement selector = %q, want lab-worker-2", got)
+	}
+	if job.Spec.Template.Spec.Affinity != nil {
+		t.Fatal("expected no affinity for required-node-only placement")
+	}
+}
+
+func TestBuildJob_MapsPreferredPlacementToNodeAffinity(t *testing.T) {
+	spec := api.RunSpec{
+		SpecVersion: 1,
+		RunID:       "run-preferred-placement",
+		ImageRef:    "busybox:1.36",
+		Command:     []string{"sh", "-c", "echo hi"},
+		Placement: &api.Placement{
+			PreferredNodes: []api.WeightedNodePreference{
+				{NodeName: "lab-worker-1", Weight: 100},
+				{NodeName: "lab-worker-2", Weight: 50},
+			},
+		},
+	}
+
+	job := buildJob(spec, "default")
+
+	if len(job.Spec.Template.Spec.NodeSelector) != 0 {
+		t.Fatalf("expected no nodeSelector for preferred-only placement, got %+v", job.Spec.Template.Spec.NodeSelector)
+	}
+	affinity := job.Spec.Template.Spec.Affinity
+	if affinity == nil || affinity.NodeAffinity == nil {
+		t.Fatal("expected node affinity for preferred placement")
+	}
+	terms := affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+	if len(terms) != 2 {
+		t.Fatalf("preferred terms = %d, want 2", len(terms))
+	}
+	if terms[0].Weight != 100 || terms[0].Preference.MatchExpressions[0].Values[0] != "lab-worker-1" {
+		t.Fatalf("unexpected first preferred term: %+v", terms[0])
+	}
+	if terms[1].Weight != 50 || terms[1].Preference.MatchExpressions[0].Values[0] != "lab-worker-2" {
+		t.Fatalf("unexpected second preferred term: %+v", terms[1])
 	}
 }
 

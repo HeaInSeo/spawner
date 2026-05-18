@@ -42,6 +42,38 @@ func TestRunSpecValidate(t *testing.T) {
 	}).Validate(); !errors.Is(err, sErr.ErrInvalidCommand) {
 		t.Fatalf("expected ErrInvalidCommand for invalid cleanup ttl, got %v", err)
 	}
+
+	if err := (api.RunSpec{
+		RunID:    "run-1",
+		ImageRef: "busybox:1.36",
+		Placement: &api.Placement{
+			PreferredNodes: []api.WeightedNodePreference{{NodeName: "node-a", Weight: 0}},
+		},
+	}).Validate(); !errors.Is(err, sErr.ErrInvalidCommand) {
+		t.Fatalf("expected ErrInvalidCommand for invalid preferred weight, got %v", err)
+	}
+
+	if err := (api.RunSpec{
+		RunID:    "run-1",
+		ImageRef: "busybox:1.36",
+		Placement: &api.Placement{
+			RequiredNodeName: "node-a",
+			PreferredNodes:   []api.WeightedNodePreference{{NodeName: "node-b", Weight: 50}},
+		},
+	}).Validate(); !errors.Is(err, sErr.ErrInvalidCommand) {
+		t.Fatalf("expected ErrInvalidCommand for mixed required/preferred placement, got %v", err)
+	}
+
+	if err := (api.RunSpec{
+		RunID:    "run-1",
+		ImageRef: "busybox:1.36",
+		Placement: &api.Placement{
+			RequiredNodeName: "node-a",
+			NodeSelector:     map[string]string{"kubernetes.io/hostname": "node-b"},
+		},
+	}).Validate(); !errors.Is(err, sErr.ErrInvalidCommand) {
+		t.Fatalf("expected ErrInvalidCommand for conflicting hostname selector, got %v", err)
+	}
 }
 
 func TestCommandConstructorsAndValidate(t *testing.T) {

@@ -214,7 +214,8 @@ func buildJob(spec api.RunSpec, ns string) *batchv1.Job {
 					RestartPolicy:      corev1.RestartPolicyNever,
 					Containers:         []corev1.Container{container},
 					Volumes:            volumes,
-					NodeSelector:       buildNodeSelector(spec.Placement),
+					NodeSelector:       buildPlacementNodeSelector(spec.Placement),
+					Affinity:           buildPlacementAffinity(spec.Placement),
 				},
 			},
 		},
@@ -237,15 +238,49 @@ func buildEnvVars(env map[string]string, fieldRefs map[string]string) []corev1.E
 	return vars
 }
 
-func buildNodeSelector(p *api.Placement) map[string]string {
-	if p == nil || len(p.NodeSelector) == 0 {
+func buildPlacementNodeSelector(p *api.Placement) map[string]string {
+	if p == nil {
 		return nil
 	}
-	out := make(map[string]string, len(p.NodeSelector))
+	size := len(p.NodeSelector)
+	if p.RequiredNodeName != "" {
+		size++
+	}
+	if size == 0 {
+		return nil
+	}
+	out := make(map[string]string, size)
 	for k, v := range p.NodeSelector {
 		out[k] = v
 	}
+	if p.RequiredNodeName != "" {
+		out["kubernetes.io/hostname"] = p.RequiredNodeName
+	}
 	return out
+}
+
+func buildPlacementAffinity(p *api.Placement) *corev1.Affinity {
+	if p == nil || len(p.PreferredNodes) == 0 {
+		return nil
+	}
+	terms := make([]corev1.PreferredSchedulingTerm, 0, len(p.PreferredNodes))
+	for _, pref := range p.PreferredNodes {
+		terms = append(terms, corev1.PreferredSchedulingTerm{
+			Weight: int32(pref.Weight),
+			Preference: corev1.NodeSelectorTerm{
+				MatchExpressions: []corev1.NodeSelectorRequirement{{
+					Key:      "kubernetes.io/hostname",
+					Operator: corev1.NodeSelectorOpIn,
+					Values:   []string{pref.NodeName},
+				}},
+			},
+		})
+	}
+	return &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: terms,
+		},
+	}
 }
 
 func buildResources(r api.Resources) corev1.ResourceRequirements {
