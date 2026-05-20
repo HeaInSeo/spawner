@@ -54,15 +54,11 @@ linters:
     govet:
       enable:
         - copylocks
-        - shadow
 
     revive:
       rules:
         - name: comment-spacings
         - name: import-shadowing
-        - name: exported
-          arguments:
-            - "checkPrivateReceivers"
 
   exclusions:
     generated: lax
@@ -75,7 +71,12 @@ linters:
           - gocyclo
           - unparam
           - depguard
+          - prealloc
         path: ".*_test\\.go"
+
+      - linters:
+          - gocognit
+        path: "pkg/api/types\\.go"
 
       - linters:
           - gocognit

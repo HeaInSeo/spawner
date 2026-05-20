@@ -81,38 +81,13 @@ vuln-all: govulncheck
 
 # ── Tool installation ─────────────────────────────────────────────────────────
 
-# Downloads golangci-lint to bin/ with SHA-256 checksum verification.
+# Builds golangci-lint from source using the local Go toolchain.
+# This ensures the binary is built with the same Go version as the project,
+# avoiding type-checker panics from Go version mismatches in dependencies.
 # Skips if the binary is already present — delete bin/golangci-lint to force reinstall.
 golangci-lint:
 	@mkdir -p "$(LOCALBIN)"
-	@test -x "$(GOLANGCI_LINT)" || bash -c '\
-		set -euo pipefail; \
-		curl -fsSL "https://api.github.com/repos/golangci/golangci-lint/releases/tags/$(GOLANGCI_LINT_VERSION)" >/dev/null; \
-		OS="$$(uname | tr A-Z a-z)"; \
-		ARCH="$$(uname -m)"; \
-		case "$$ARCH" in x86_64) ARCH=amd64 ;; aarch64|arm64) ARCH=arm64 ;; *) echo "unsupported arch: $$ARCH"; exit 1 ;; esac; \
-		VER="$(GOLANGCI_LINT_VERSION)"; \
-		VER="$${VER#v}"; \
-		FILE="golangci-lint-$$VER-$$OS-$$ARCH.tar.gz"; \
-		URL="https://github.com/golangci/golangci-lint/releases/download/$(GOLANGCI_LINT_VERSION)/$$FILE"; \
-		SUM_URL="https://github.com/golangci/golangci-lint/releases/download/$(GOLANGCI_LINT_VERSION)/golangci-lint-$$VER-checksums.txt"; \
-		TMP="$$(mktemp -d)"; \
-		curl -fsSL "$$URL" -o "$$TMP/lint.tgz"; \
-		curl -fsSL "$$SUM_URL" -o "$$TMP/checksums.txt"; \
-		EXPECTED="$$(awk -v f="$$FILE" "\$$2==f{print \$$1}" "$$TMP/checksums.txt")"; \
-		if [ -z "$$EXPECTED" ]; then echo "checksum not found for $$FILE"; exit 1; fi; \
-		if command -v sha256sum >/dev/null 2>&1; then \
-			ACTUAL="$$(sha256sum "$$TMP/lint.tgz" | awk "{print \$$1}")"; \
-		elif command -v shasum >/dev/null 2>&1; then \
-			ACTUAL="$$(shasum -a 256 "$$TMP/lint.tgz" | awk "{print \$$1}")"; \
-		else \
-			echo "no sha256 tool found (sha256sum/shasum)"; exit 1; \
-		fi; \
-		if [ "$$EXPECTED" != "$$ACTUAL" ]; then echo "checksum mismatch for $$FILE"; exit 1; fi; \
-		tar -xzf "$$TMP/lint.tgz" -C "$$TMP"; \
-		cp "$$TMP/golangci-lint-$$VER-$$OS-$$ARCH/golangci-lint" "$(GOLANGCI_LINT)"; \
-		chmod +x "$(GOLANGCI_LINT)"; \
-		rm -rf "$$TMP"'
+	@test -x "$(GOLANGCI_LINT)" || GOBIN="$(LOCALBIN)" go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 govulncheck:
 	@mkdir -p "$(LOCALBIN)"

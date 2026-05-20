@@ -266,7 +266,7 @@ func buildPlacementAffinity(p *api.Placement) *corev1.Affinity {
 	terms := make([]corev1.PreferredSchedulingTerm, 0, len(p.PreferredNodes))
 	for _, pref := range p.PreferredNodes {
 		terms = append(terms, corev1.PreferredSchedulingTerm{
-			Weight: int32(pref.Weight),
+			Weight: pref.Weight,
 			Preference: corev1.NodeSelectorTerm{
 				MatchExpressions: []corev1.NodeSelectorRequirement{{
 					Key:      "kubernetes.io/hostname",
