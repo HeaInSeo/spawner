@@ -12,6 +12,17 @@ on:
       - "LICENSE*"
       - ".github/**/*.md"
 
+permissions:
+  contents: read
+
+# Node.js 24 opt-in (enforcement: 2026-06-02)
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     name: Run on Ubuntu
@@ -25,7 +36,5 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v8
-        with:
-          version: v2.5.0
+      - name: Run lint guardrail
+        run: make lint

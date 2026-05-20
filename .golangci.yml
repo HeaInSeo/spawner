@@ -8,6 +8,7 @@ linters:
 
   enable:
     - copyloopvar
+    - depguard
     - dupl
     - errcheck
     - goconst
@@ -26,6 +27,17 @@ linters:
     - unused
 
   settings:
+    depguard:
+      rules:
+        pkg_no_k8s:
+          files:
+            - "pkg/**/*.go"
+          deny:
+            - pkg: "k8s.io/**"
+              desc: "pkg/ is k8s-agnostic; k8s integration lives in cmd/imp/"
+            - pkg: "sigs.k8s.io/**"
+              desc: "pkg/ is k8s-agnostic; k8s integration lives in cmd/imp/"
+
     gocognit:
       min-complexity: 20
 
@@ -39,10 +51,18 @@ linters:
     lll:
       line-length: 140
 
+    govet:
+      enable:
+        - copylocks
+        - shadow
+
     revive:
       rules:
         - name: comment-spacings
         - name: import-shadowing
+        - name: exported
+          arguments:
+            - "checkPrivateReceivers"
 
   exclusions:
     generated: lax
@@ -54,6 +74,7 @@ linters:
           - gocognit
           - gocyclo
           - unparam
+          - depguard
         path: ".*_test\\.go"
 
       - linters:

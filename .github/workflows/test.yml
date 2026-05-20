@@ -12,14 +12,21 @@ on:
       - "LICENSE*"
       - ".github/**/*.md"
 
+permissions:
+  contents: read
+
+# Node.js 24 opt-in (enforcement: 2026-06-02)
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Run on Ubuntu
     runs-on: ubuntu-latest
-    env:
-      TMPDIR: /tmp
-      GOTMPDIR: /tmp
-      GOCACHE: /tmp/go-build
     steps:
       - name: Clone the code
         uses: actions/checkout@v4
@@ -34,10 +41,14 @@ jobs:
           go mod tidy
           git diff --exit-code
 
-      - name: Run regression tests
-        run: go test ./...
+      - name: Run tests
+        run: make test
 
-      - name: Measure coverage
-        run: |
-          go test -coverprofile=/tmp/spawner.cover ./...
-          go tool cover -func=/tmp/spawner.cover | tail -n 1
+      - name: Generate coverage report
+        run: make coverage
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spawner-coverage
+          path: reports/

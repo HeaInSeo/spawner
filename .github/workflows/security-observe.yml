@@ -1,0 +1,36 @@
+name: security-observe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Node.js 24 opt-in (enforcement: 2026-06-02)
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  observe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run security lint observation
+        run: make lint-security
+
+      - name: Run vuln observation
+        run: make vuln
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: reports/
+          if-no-files-found: warn
