@@ -565,6 +565,26 @@ func (a *rejectEnqueueActor) OnIdle(_ func())                                  {
 func (a *rejectEnqueueActor) OnTerminate(_ func())                             {}
 func (a *rejectEnqueueActor) Loop(_ context.Context)                           {}
 
+// failOnceBinder: 첫 번째 Bind는 에러, 이후는 성공 → semaphore rollback 후 재진입 가능 확인용
+type failOnceBinder struct {
+	mu     sync.Mutex
+	called int
+	act    actor.Actor
+}
+
+func (f *failOnceBinder) Get(_ string) (actor.Actor, bool) { return nil, false }
+func (f *failOnceBinder) Bind(_ string) (actor.Actor, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.called++
+	if f.called == 1 {
+		return nil, false, errors.New("transient bind error")
+	}
+	return f.act, true, nil
+}
+func (f *failOnceBinder) Register(_ string, _ actor.Actor) {}
+func (f *failOnceBinder) Unbind(_ string, _ actor.Actor)   {}
+
 // dualSignalActor: OnIdle + OnTerminate 모두 등록하고, CmdRun 수신 시 두 콜백을 순서대로 호출.
 // releaseOnce(sync.Once)가 두 번째 호출을 막는지 검증하기 위해 사용.
 type dualSignalActor struct {
@@ -748,6 +768,31 @@ func TestDispatcher_ReleaseOnce_PreventsDoubleUnbind(t *testing.T) {
 	f.mu.Unlock()
 	if calls != 1 {
 		t.Fatalf("expected Unbind called exactly once, got %d", calls)
+	}
+}
+
+// TestDispatcher_FailureWithMaxActors1_NextRequestSucceeds: maxActors=1 환경에서
+// Bind 실패 후 세마포어가 반납되어 동일 Dispatcher에 대한 다음 요청이
+// ErrSaturated 없이 정상 처리될 수 있어야 한다.
+func TestDispatcher_FailureWithMaxActors1_NextRequestSucceeds(t *testing.T) {
+	fd := &mockFD{
+		key: "k",
+		cmd: api.Command{Kind: api.CmdRun, Run: &api.RunSpec{RunID: "r1", ImageRef: "busybox:1.36"}},
+	}
+	fac := &failOnceBinder{act: &mockActor{}}
+	d := dispatcher.NewDispatcher(fd, fac, 1)
+
+	// 첫 번째 요청: Bind 에러 → semaphore rollback
+	if err := d.Handle(context.Background(), testInput(), nil); err == nil {
+		t.Fatal("expected error on first Handle (Bind fails)")
+	}
+	if n := len(d.Sem); n != 0 {
+		t.Fatalf("semaphore not rolled back after first failure: len=%d cap=%d", n, cap(d.Sem))
+	}
+
+	// 두 번째 요청: 동일 Dispatcher, semaphore가 반납되었으므로 성공해야 함
+	if err := d.Handle(context.Background(), testInput(), nil); err != nil {
+		t.Fatalf("second Handle should succeed after semaphore released, got: %v", err)
 	}
 }
 

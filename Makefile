@@ -59,7 +59,7 @@ test-race:
 test-lifecycle:
 	@mkdir -p "$(GOCACHE_DIR)" "$(GOTMPDIR)"
 	$(GOENV) go test -race -count=10 \
-	    -run 'TestIngress_ReleasesSlotAfterActorBecomesIdle|TestDispatcher_SemaphoreLifecycleNoLeak|TestK8sActor_LoopExitsCleanly_NoLeak|TestMailbox_ProducerPool_NoLeak' \
+	    -run 'TestIngress_ReleasesSlotAfterActorBecomesIdle|TestDispatcher_SemaphoreLifecycleNoLeak|TestDispatcher_FailureWithMaxActors1_NextRequestSucceeds|TestK8sActor_LoopExitsCleanly_NoLeak|TestK8sActor_LoopCancel_ActiveRunEmitsFailedEvent|TestK8sActor_CancelFailure_LoopSurvives|TestMailbox_ProducerPool_NoLeak|TestMailbox_ProducerTryEnqueueDuringClose_NoPanic' \
 	    $(PKGS_LIFECYCLE)
 
 # ── Format / Vet ──────────────────────────────────────────────────────────────

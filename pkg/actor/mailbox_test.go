@@ -228,6 +228,78 @@ func TestMailbox_ProducerPool_NoLeak(t *testing.T) {
 	goleak.VerifyNone(t)
 }
 
+// TestMailbox_CloseIdempotent: Close를 여러 번 호출해도 panic 없이 채널이 정확히 한 번 닫혀야 한다.
+func TestMailbox_CloseIdempotent(t *testing.T) {
+	mb := actor.NewMailbox[int](4)
+	mb.AddSender()
+
+	mb.Close()
+	mb.Close()
+	mb.Close()
+
+	mb.SenderDone()
+
+	select {
+	case _, ok := <-mb.C():
+		if ok {
+			t.Fatal("expected closed channel, got open")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("channel not closed after Close")
+	}
+}
+
+// TestMailbox_TryEnqueueAfterClose_ReturnsFalse: Close 후 TryEnqueue는 블로킹 없이 false를 반환해야 한다.
+func TestMailbox_TryEnqueueAfterClose_ReturnsFalse(t *testing.T) {
+	mb := actor.NewMailbox[int](4)
+	mb.AddSender()
+	mb.Close()
+
+	if mb.TryEnqueue(42) {
+		t.Fatal("expected TryEnqueue to return false after Close")
+	}
+
+	mb.SenderDone()
+	for range mb.C() {
+	}
+}
+
+// TestMailbox_ProducerTryEnqueueDuringClose_NoPanic: Close 신호 이후 생산자가 TryEnqueue를 시도해도
+// 패닉 없이 false를 반환해야 한다.
+// Invariant: AddSender는 Close 이전에 호출하므로 wg.Wait()는 SenderDone 전에 완료되지 않는다.
+// 따라서 m.ch는 생산자가 살아 있는 동안 close되지 않으며 panic이 발생할 수 없다.
+func TestMailbox_ProducerTryEnqueueDuringClose_NoPanic(t *testing.T) {
+	mb := actor.NewMailbox[int](4)
+	mb.AddSender()
+
+	proceed := make(chan struct{})
+	producerDone := make(chan struct{})
+
+	go func() {
+		defer close(producerDone)
+		defer mb.SenderDone()
+		<-proceed
+		// m.closed는 닫혀 있어야 하므로 TryEnqueue는 false를 반환해야 함
+		if mb.TryEnqueue(99) {
+			t.Error("expected TryEnqueue to return false after Close")
+		}
+	}()
+
+	mb.Close()     // m.closed 닫힘; ch close는 SenderDone 대기 중
+	close(proceed) // 생산자 진행
+
+	<-producerDone
+
+	select {
+	case _, ok := <-mb.C():
+		if ok {
+			t.Fatal("expected closed channel after producer done")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("channel not closed after producer completed SenderDone")
+	}
+}
+
 func collectInts(t *testing.T, mb *actor.Mailbox[int], n int) []int {
 	t.Helper()
 	values := make([]int, 0, n)
