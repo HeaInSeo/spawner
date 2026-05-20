@@ -149,6 +149,59 @@ func TestStartProducerPool_CancelStopsProducers(t *testing.T) {
 	}
 }
 
+// TestStartProducerPool_SendersRegisteredBeforeReturn: StartProducerPool 반환 시점에
+// 모든 생산자의 wg.Add(1)이 완료되어 있어야 한다.
+// 수정 전에는 AddSender가 고루틴 내부에서 지연 실행되어, 반환 직후 Close를 호출하면
+// wg.Wait()이 count=0인 채로 통과해 채널을 조기 종료하는 lifecycle race가 있었다.
+func TestStartProducerPool_SendersRegisteredBeforeReturn(t *testing.T) {
+	mb := actor.NewMailbox[int](4)
+	// 반환 즉시 cancel+Close: 수정 전이면 -race에서 탐지됨
+	cancel := actor.StartProducerPool(context.Background(), mb, 3, func(ctx context.Context, _ int, _ func(int) bool, _ func(context.Context, int) bool) {
+		<-ctx.Done()
+	})
+	cancel()
+	mb.Close()
+	for range mb.C() {
+	}
+	goleak.VerifyNone(t)
+}
+
+// TestMailbox_CloseAfterCancel_ChannelClosed: cancel 후 Close를 호출하면
+// 모든 생산자 고루틴이 종료된 뒤 데이터 채널이 닫혀야 한다.
+func TestMailbox_CloseAfterCancel_ChannelClosed(t *testing.T) {
+	mb := actor.NewMailbox[int](4)
+	cancel := actor.StartProducerPool(context.Background(), mb, 2, func(ctx context.Context, id int, try func(int) bool, _ func(context.Context, int) bool) {
+		ticker := time.NewTicker(2 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = try(id)
+			}
+		}
+	})
+
+	cancel()
+	mb.Close()
+
+	// 채널이 닫힐 때까지 drain; 닫히지 않으면 타임아웃
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for range mb.C() {
+		}
+	}()
+
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("mailbox channel not closed after cancel+Close")
+	}
+	goleak.VerifyNone(t)
+}
+
 func TestMailbox_ProducerPool_NoLeak(t *testing.T) {
 	mb := actor.NewMailbox[int](8)
 	ctx := context.Background()

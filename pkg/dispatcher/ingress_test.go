@@ -508,10 +508,11 @@ func (a *lifecycleActor) OnTerminate(func())     {}
 func (a *lifecycleActor) Loop(_ context.Context) {}
 
 type lifecycleFactory struct {
-	mu      sync.Mutex
-	act     *lifecycleActor
-	created int
-	bound   map[string]actor.Actor
+	mu          sync.Mutex
+	act         actor.Actor
+	created     int
+	bound       map[string]actor.Actor
+	unbindCalls int
 }
 
 func (f *lifecycleFactory) Get(spawnKey string) (actor.Actor, bool) {
@@ -537,10 +538,83 @@ func (f *lifecycleFactory) Register(spawnKey string, act actor.Actor) {
 func (f *lifecycleFactory) Unbind(spawnKey string, act actor.Actor) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.unbindCalls++
 	if cur, ok := f.bound[spawnKey]; ok && cur == act {
 		delete(f.bound, spawnKey)
 	}
 }
+
+// ── failure-path mocks ────────────────────────────────────────────────────────
+
+// bindErrFactory: Bind 항상 실패 → semaphore rollback 테스트용
+type bindErrFactory struct{}
+
+func (f *bindErrFactory) Get(_ string) (actor.Actor, bool) { return nil, false }
+func (f *bindErrFactory) Bind(_ string) (actor.Actor, bool, error) {
+	return nil, false, errors.New("bind: backend unavailable")
+}
+func (f *bindErrFactory) Register(_ string, _ actor.Actor) {}
+func (f *bindErrFactory) Unbind(_ string, _ actor.Actor)   {}
+
+// rejectEnqueueActor: EnqueueCtx 항상 false → ErrMailboxFull 유도
+type rejectEnqueueActor struct{}
+
+func (a *rejectEnqueueActor) EnqueueTry(_ api.Command) bool                    { return false }
+func (a *rejectEnqueueActor) EnqueueCtx(_ context.Context, _ api.Command) bool { return false }
+func (a *rejectEnqueueActor) OnIdle(_ func())                                  {}
+func (a *rejectEnqueueActor) OnTerminate(_ func())                             {}
+func (a *rejectEnqueueActor) Loop(_ context.Context)                           {}
+
+// dualSignalActor: OnIdle + OnTerminate 모두 등록하고, CmdRun 수신 시 두 콜백을 순서대로 호출.
+// releaseOnce(sync.Once)가 두 번째 호출을 막는지 검증하기 위해 사용.
+type dualSignalActor struct {
+	mu         sync.Mutex
+	idleFn     func()
+	termFn     func()
+	idleOnce   sync.Once
+	termOnce   sync.Once
+	idleSignal chan struct{}
+	termSignal chan struct{}
+}
+
+func newDualSignalActor() *dualSignalActor {
+	return &dualSignalActor{
+		idleSignal: make(chan struct{}),
+		termSignal: make(chan struct{}),
+	}
+}
+
+func (a *dualSignalActor) EnqueueTry(_ api.Command) bool { return true }
+func (a *dualSignalActor) EnqueueCtx(_ context.Context, cmd api.Command) bool {
+	if cmd.Kind != api.CmdRun {
+		return true
+	}
+	a.mu.Lock()
+	idle, term := a.idleFn, a.termFn
+	a.mu.Unlock()
+	go func() {
+		if idle != nil {
+			idle()
+			a.idleOnce.Do(func() { close(a.idleSignal) })
+		}
+		if term != nil {
+			term()
+			a.termOnce.Do(func() { close(a.termSignal) })
+		}
+	}()
+	return true
+}
+func (a *dualSignalActor) OnIdle(fn func()) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.idleFn = fn
+}
+func (a *dualSignalActor) OnTerminate(fn func()) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.termFn = fn
+}
+func (a *dualSignalActor) Loop(_ context.Context) {}
 
 func TestIngress_ReleasesSlotAfterActorBecomesIdle(t *testing.T) {
 	fd := &mockFD{
@@ -597,6 +671,84 @@ func TestDispatcher_SemaphoreLifecycleNoLeak(t *testing.T) {
 	}
 
 	goleak.VerifyNone(t)
+}
+
+// TestDispatcher_BindFailure_SemaphoreRolledBack: Factory.Bind가 에러를 반환하면
+// 획득한 세마포어 슬롯이 즉시 반납되어야 한다.
+func TestDispatcher_BindFailure_SemaphoreRolledBack(t *testing.T) {
+	fd := &mockFD{
+		key: "teamA:run-001",
+		cmd: api.Command{Kind: api.CmdRun, Run: &api.RunSpec{RunID: "run-001", ImageRef: "busybox:1.36"}},
+	}
+	d := dispatcher.NewDispatcher(fd, &bindErrFactory{}, 1)
+
+	if err := d.Handle(context.Background(), testInput(), nil); err == nil {
+		t.Fatal("expected Bind error, got nil")
+	}
+
+	if n := len(d.Sem); n != 0 {
+		t.Fatalf("semaphore not released after Bind failure: len=%d cap=%d", n, cap(d.Sem))
+	}
+}
+
+// TestDispatcher_EnqueueBindFailure_SemaphoreRolledBack: bind 커맨드 Enqueue가 실패(ErrMailboxFull)하면
+// 획득한 세마포어 슬롯과 등록된 액터가 롤백되어야 한다.
+func TestDispatcher_EnqueueBindFailure_SemaphoreRolledBack(t *testing.T) {
+	fd := &mockFD{
+		key: "teamA:run-001",
+		cmd: api.Command{Kind: api.CmdRun, Run: &api.RunSpec{RunID: "run-001", ImageRef: "busybox:1.36"}},
+	}
+	f := &lifecycleFactory{act: &rejectEnqueueActor{}, bound: make(map[string]actor.Actor)}
+	d := dispatcher.NewDispatcher(fd, f, 1)
+
+	err := d.Handle(context.Background(), testInput(), nil)
+	if !errors.Is(err, sErr.ErrMailboxFull) {
+		t.Fatalf("expected ErrMailboxFull, got %v", err)
+	}
+
+	if n := len(d.Sem); n != 0 {
+		t.Fatalf("semaphore not released after enqueue failure: len=%d cap=%d", n, cap(d.Sem))
+	}
+}
+
+// TestDispatcher_ReleaseOnce_PreventsDoubleUnbind: OnIdle과 OnTerminate에 같은 releaseOnce 클로저가
+// 등록될 때, 두 콜백이 모두 호출되어도 Unbind는 정확히 한 번만 실행되어야 한다(sync.Once 보장).
+func TestDispatcher_ReleaseOnce_PreventsDoubleUnbind(t *testing.T) {
+	fd := &mockFD{
+		key: "teamA:run-001",
+		cmd: api.Command{Kind: api.CmdRun, Run: &api.RunSpec{RunID: "run-001", ImageRef: "busybox:1.36"}},
+	}
+	act := newDualSignalActor()
+	f := &lifecycleFactory{act: act, bound: make(map[string]actor.Actor)}
+	d := dispatcher.NewDispatcher(fd, f, 1)
+
+	if err := d.Handle(context.Background(), testInput(), nil); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	// 두 콜백이 모두 실행될 때까지 대기
+	select {
+	case <-act.idleSignal:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for idle signal")
+	}
+	select {
+	case <-act.termSignal:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for term signal")
+	}
+
+	// semaphore는 정확히 한 번 반납되어야 한다
+	if n := len(d.Sem); n != 0 {
+		t.Fatalf("semaphore not released: len=%d", n)
+	}
+	// Unbind도 정확히 한 번만 호출되어야 한다 (sync.Once가 두 번째 releaseOnce를 막음)
+	f.mu.Lock()
+	calls := f.unbindCalls
+	f.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("expected Unbind called exactly once, got %d", calls)
+	}
 }
 
 func TestIngress_DoesNotPersistInvalidResolvedRun(t *testing.T) {

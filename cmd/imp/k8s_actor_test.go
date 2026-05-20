@@ -2,6 +2,7 @@ package imp
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +32,53 @@ func (s *actorTestSink) snapshot() []api.Event {
 	out := make([]api.Event, len(s.events))
 	copy(out, s.events)
 	return out
+}
+
+// chanSink: 이벤트를 슬라이스에 누적하고 notify 채널로 수신자에게 알린다.
+// time.Sleep 없이 특정 State가 도착할 때까지 결정론적으로 대기할 수 있다.
+type chanSink struct {
+	mu     sync.Mutex
+	events []api.Event
+	notify chan struct{}
+}
+
+func newChanSink() *chanSink { return &chanSink{notify: make(chan struct{}, 64)} }
+
+func (s *chanSink) Send(ev api.Event) {
+	s.mu.Lock()
+	s.events = append(s.events, ev)
+	s.mu.Unlock()
+	select {
+	case s.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (s *chanSink) waitFor(t *testing.T, pred func(api.Event) bool, timeout time.Duration) api.Event {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		s.mu.Lock()
+		for _, ev := range s.events {
+			if pred(ev) {
+				s.mu.Unlock()
+				return ev
+			}
+		}
+		s.mu.Unlock()
+		select {
+		case <-s.notify:
+		case <-timer.C:
+			t.Fatal("timed out waiting for expected event")
+			return api.Event{}
+		}
+	}
+}
+
+func (s *chanSink) waitState(t *testing.T, state api.State, timeout time.Duration) api.Event {
+	t.Helper()
+	return s.waitFor(t, func(ev api.Event) bool { return ev.State == state }, timeout)
 }
 
 type actorTestDriver struct {
@@ -257,6 +305,142 @@ func TestK8sActor_LoopExitsCleanly_NoLeak(t *testing.T) {
 	cancel()
 	<-done
 
+	goleak.VerifyNone(t)
+}
+
+// ── failure-path / lifecycle invariant tests (chanSink 기반, sleep 없음) ──────
+
+// TestK8sActor_PrepareFailure_EmitsFailedEvent: driver.Prepare가 에러를 반환하면
+// StateFailed 이벤트가 발생하고 Loop가 정상 종료되어야 한다.
+func TestK8sActor_PrepareFailure_EmitsFailedEvent(t *testing.T) {
+	sink := newChanSink()
+	drv := &actorTestDriver{prepareErr: errors.New("disk quota exceeded")}
+	a := NewK8sActor("spawn-1", drv, 8)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); a.Loop(ctx) }()
+
+	mustEnqueue(t, a, api.Command{Kind: api.CmdBind, Bind: &api.Bind{SpawnKey: "spawn-1"}, Sink: sink})
+	sink.waitState(t, api.StateStarting, 2*time.Second)
+
+	mustEnqueue(t, a, api.Command{
+		Kind:   api.CmdRun,
+		Run:    &api.RunSpec{RunID: "run-1", ImageRef: "busybox:1.36"},
+		Policy: policy.DefaultPolicyB(time.Second),
+		Sink:   sink,
+	})
+
+	sink.waitState(t, api.StateFailed, 2*time.Second)
+
+	cancel()
+	<-done
+	goleak.VerifyNone(t)
+}
+
+// TestK8sActor_StartFailure_EmitsFailedEvent: driver.Start가 에러를 반환하면
+// StateFailed 이벤트가 발생하고 Loop가 정상 종료되어야 한다.
+func TestK8sActor_StartFailure_EmitsFailedEvent(t *testing.T) {
+	sink := newChanSink()
+	drv := &actorTestDriver{startErr: errors.New("image pull failed")}
+	a := NewK8sActor("spawn-1", drv, 8)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); a.Loop(ctx) }()
+
+	mustEnqueue(t, a, api.Command{Kind: api.CmdBind, Bind: &api.Bind{SpawnKey: "spawn-1"}, Sink: sink})
+	sink.waitState(t, api.StateStarting, 2*time.Second)
+
+	mustEnqueue(t, a, api.Command{
+		Kind:   api.CmdRun,
+		Run:    &api.RunSpec{RunID: "run-1", ImageRef: "busybox:1.36"},
+		Policy: policy.DefaultPolicyB(time.Second),
+		Sink:   sink,
+	})
+
+	sink.waitState(t, api.StateFailed, 2*time.Second)
+
+	cancel()
+	<-done
+	goleak.VerifyNone(t)
+}
+
+// TestK8sActor_OnTermCalledExactlyOnce: Loop가 종료될 때 onTerm 콜백은
+// 정확히 한 번만 호출되어야 한다.
+func TestK8sActor_OnTermCalledExactlyOnce(t *testing.T) {
+	var mu sync.Mutex
+	termCount := 0
+
+	a := NewK8sActor("spawn-1", &actorTestDriver{}, 8)
+	a.OnTerminate(func() {
+		mu.Lock()
+		termCount++
+		mu.Unlock()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); a.Loop(ctx) }()
+
+	cancel()
+	<-done
+
+	mu.Lock()
+	n := termCount
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("expected onTerm called exactly once, got %d", n)
+	}
+	goleak.VerifyNone(t)
+}
+
+// TestK8sActor_CancelDuringRun_NoDeadlock: 실행 중인 run에 CmdCancel을 전송하면
+// StateCancelling → StateFailed 이벤트 순서가 보장되고 Loop가 정상 종료되어야 한다.
+func TestK8sActor_CancelDuringRun_NoDeadlock(t *testing.T) {
+	sink := newChanSink()
+	drv := &actorTestDriver{
+		waitStarted: make(chan struct{}),
+		waitBlock:   make(chan struct{}),
+	}
+	a := NewK8sActor("spawn-1", drv, 8)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); a.Loop(ctx) }()
+
+	mustEnqueue(t, a, api.Command{Kind: api.CmdBind, Bind: &api.Bind{SpawnKey: "spawn-1"}, Sink: sink})
+	sink.waitState(t, api.StateStarting, 2*time.Second)
+
+	mustEnqueue(t, a, api.Command{
+		Kind:   api.CmdRun,
+		Run:    &api.RunSpec{RunID: "run-1", ImageRef: "busybox:1.36"},
+		Policy: policy.DefaultPolicyB(5 * time.Second),
+		Sink:   sink,
+	})
+
+	select {
+	case <-drv.waitStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not start within timeout")
+	}
+	sink.waitState(t, api.StateRunning, 2*time.Second)
+
+	mustEnqueue(t, a, api.Command{
+		Kind:   api.CmdCancel,
+		Cancel: &api.CancelReq{RunID: "run-1"},
+		Sink:   sink,
+	})
+
+	sink.waitState(t, api.StateCancelling, 2*time.Second)
+	// runCtx가 취소되면 Wait이 ctx.Err()를 반환 → StateFailed
+	sink.waitState(t, api.StateFailed, 2*time.Second)
+
+	cancel()
+	<-done
 	goleak.VerifyNone(t)
 }
 
