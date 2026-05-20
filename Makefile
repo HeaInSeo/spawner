@@ -14,11 +14,14 @@ GOVULNCHECK_VERSION := v1.1.4
 
 GOENV := GOCACHE="$(GOCACHE_DIR)" GOTMPDIR="$(GOTMPDIR)"
 
-PKGS_ALL      := ./...
-PKGS_CORE     := ./cmd/... ./pkg/...
-PKGS_SECURITY := ./cmd/... ./pkg/...
+PKGS_ALL        := ./...
+PKGS_CORE       := ./cmd/... ./pkg/...
+PKGS_SECURITY   := ./cmd/... ./pkg/...
+PKGS_LIFECYCLE  := ./pkg/actor ./pkg/dispatcher ./cmd/imp
 
-.PHONY: test coverage fmt vet lint lint-depguard lint-fix lint-security vuln vuln-all golangci-lint govulncheck
+COVERAGE_THRESHOLD := 70
+
+.PHONY: test coverage coverage-check fmt vet lint lint-depguard lint-fix lint-security vuln vuln-all test-race test-lifecycle golangci-lint govulncheck
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -32,6 +35,32 @@ coverage:
 	@mkdir -p "$(REPORT_DIR)" "$(GOCACHE_DIR)" "$(GOTMPDIR)"
 	$(GOENV) go test $(PKGS_CORE) -coverprofile="$(REPORT_DIR)/cover.out" -covermode=atomic
 	go tool cover -func="$(REPORT_DIR)/cover.out" | tee "$(REPORT_DIR)/coverage.txt"
+
+# coverage-check: total coverage가 COVERAGE_THRESHOLD 미만이면 exit 1.
+# make coverage 실행 후 호출하거나 단독 실행 가능.
+coverage-check: coverage
+	@total=$$(go tool cover -func="$(REPORT_DIR)/cover.out" \
+	    | awk '/^total:/ {gsub(/%/,"",$$NF); print int($$NF)}'); \
+	echo "[spawner] coverage: $${total}% (threshold: $(COVERAGE_THRESHOLD)%)"; \
+	if [ "$${total}" -lt "$(COVERAGE_THRESHOLD)" ]; then \
+	    echo "[spawner] FAIL: coverage $${total}% < threshold $(COVERAGE_THRESHOLD)%"; exit 1; \
+	fi
+
+# ── Race / Lifecycle regression ───────────────────────────────────────────────
+
+# test-race: 핵심 lifecycle 패키지에만 -race를 실행 (make test보다 빠른 피드백용).
+# make test도 -race를 포함하므로 CI에서는 make test로 충분하다.
+test-race:
+	@mkdir -p "$(GOCACHE_DIR)" "$(GOTMPDIR)"
+	$(GOENV) go test -race $(PKGS_LIFECYCLE)
+
+# test-lifecycle: goroutine leak / semaphore lifecycle 테스트를 -count=10으로 반복.
+# 간헐적 race나 leak을 조기에 발견하기 위한 로컬 회귀 타겟.
+test-lifecycle:
+	@mkdir -p "$(GOCACHE_DIR)" "$(GOTMPDIR)"
+	$(GOENV) go test -race -count=10 \
+	    -run 'TestIngress_ReleasesSlotAfterActorBecomesIdle|TestDispatcher_SemaphoreLifecycleNoLeak|TestK8sActor_LoopExitsCleanly_NoLeak|TestMailbox_ProducerPool_NoLeak' \
+	    $(PKGS_LIFECYCLE)
 
 # ── Format / Vet ──────────────────────────────────────────────────────────────
 
