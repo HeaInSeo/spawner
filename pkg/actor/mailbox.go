@@ -118,6 +118,8 @@ func ForwardChan[T any](ctx context.Context, m *Mailbox[T], in <-chan T) {
 }
 
 // StartProducerPool N개의 생산자 고루틴을 띄우고, cancel로 종료. 각 생산자는 gen 콜백을 실행(내부에서 try/sendCtx 제공) 반환된 cancel을 호출하면 모든 생산자 종료를 유도
+// AddSender is called synchronously before each goroutine starts so that Close() called
+// immediately after StartProducerPool returns cannot race with wg.Add inside the goroutine.
 func StartProducerPool[T any](
 	parent context.Context,
 	m *Mailbox[T],
@@ -126,9 +128,11 @@ func StartProducerPool[T any](
 ) (cancel context.CancelFunc) {
 	ctx, cancel := context.WithCancel(parent)
 	for i := 0; i < n; i++ {
-		go WithProducer(m, func(try func(T) bool, sendCtx func(context.Context, T) bool) {
-			gen(ctx, i, try, sendCtx)
-		})
+		m.AddSender()
+		go func(id int) {
+			defer m.SenderDone()
+			gen(ctx, id, m.TryEnqueue, m.Enqueue)
+		}(i)
 	}
 	return cancel
 }

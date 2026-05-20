@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/goleak"
+
 	"github.com/HeaInSeo/spawner/pkg/actor"
 )
 
@@ -145,6 +147,32 @@ func TestStartProducerPool_CancelStopsProducers(t *testing.T) {
 			t.Fatalf("unexpected producer id value: %d", v)
 		}
 	}
+}
+
+func TestMailbox_ProducerPool_NoLeak(t *testing.T) {
+	mb := actor.NewMailbox[int](8)
+	ctx := context.Background()
+
+	cancel := actor.StartProducerPool(ctx, mb, 2, func(ctx context.Context, id int, try func(int) bool, _ func(context.Context, int) bool) {
+		ticker := time.NewTicker(2 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = try(id)
+			}
+		}
+	})
+
+	cancel()
+	mb.Close()
+
+	for range mb.C() {
+	}
+
+	goleak.VerifyNone(t)
 }
 
 func collectInts(t *testing.T, mb *actor.Mailbox[int], n int) []int {

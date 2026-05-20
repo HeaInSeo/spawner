@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"go.uber.org/goleak"
 
 	"github.com/HeaInSeo/spawner/pkg/actor"
 	"github.com/HeaInSeo/spawner/pkg/api"
@@ -473,41 +476,67 @@ func TestIngress_IdempotentEnqueue(t *testing.T) {
 var _ = dispatcher.WithEnqueueTimeout(time.Second)
 
 type lifecycleActor struct {
-	idleFn func()
+	mu         sync.Mutex
+	idleFn     func()
+	idleOnce   sync.Once
+	idleSignal chan struct{}
+}
+
+func newLifecycleActor() *lifecycleActor {
+	return &lifecycleActor{idleSignal: make(chan struct{})}
 }
 
 func (a *lifecycleActor) EnqueueTry(api.Command) bool { return true }
 func (a *lifecycleActor) EnqueueCtx(_ context.Context, cmd api.Command) bool {
-	if cmd.Kind == api.CmdRun && a.idleFn != nil {
-		go a.idleFn()
+	a.mu.Lock()
+	fn := a.idleFn
+	a.mu.Unlock()
+	if cmd.Kind == api.CmdRun && fn != nil {
+		go fn()
 	}
 	return true
 }
-func (a *lifecycleActor) OnIdle(fn func())       { a.idleFn = fn }
+func (a *lifecycleActor) OnIdle(fn func()) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.idleFn = func() {
+		fn()
+		a.idleOnce.Do(func() { close(a.idleSignal) })
+	}
+}
 func (a *lifecycleActor) OnTerminate(func())     {}
 func (a *lifecycleActor) Loop(_ context.Context) {}
 
 type lifecycleFactory struct {
+	mu      sync.Mutex
 	act     *lifecycleActor
 	created int
 	bound   map[string]actor.Actor
 }
 
 func (f *lifecycleFactory) Get(spawnKey string) (actor.Actor, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	act, ok := f.bound[spawnKey]
 	return act, ok
 }
 
 func (f *lifecycleFactory) Bind(_ string) (actor.Actor, bool, error) {
+	f.mu.Lock()
 	f.created++
+	f.mu.Unlock()
 	return f.act, true, nil
 }
 
 func (f *lifecycleFactory) Register(spawnKey string, act actor.Actor) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.bound[spawnKey] = act
 }
 
 func (f *lifecycleFactory) Unbind(spawnKey string, act actor.Actor) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if cur, ok := f.bound[spawnKey]; ok && cur == act {
 		delete(f.bound, spawnKey)
 	}
@@ -518,13 +547,18 @@ func TestIngress_ReleasesSlotAfterActorBecomesIdle(t *testing.T) {
 		key: "teamA:run-001",
 		cmd: api.Command{Kind: api.CmdRun, Run: &api.RunSpec{RunID: "run-001", ImageRef: "busybox:1.36"}},
 	}
-	act := &lifecycleActor{}
+	act := newLifecycleActor()
 	f := &lifecycleFactory{act: act, bound: make(map[string]actor.Actor)}
 	d := dispatcher.NewDispatcher(fd, f, 1)
 
-	input1 := testInput()
-	if err := d.Handle(context.Background(), input1, nil); err != nil {
+	if err := d.Handle(context.Background(), testInput(), nil); err != nil {
 		t.Fatalf("first Handle: %v", err)
+	}
+
+	select {
+	case <-act.idleSignal:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for semaphore release after actor became idle")
 	}
 
 	fd.key = "teamA:run-002"
@@ -538,20 +572,31 @@ func TestIngress_ReleasesSlotAfterActorBecomesIdle(t *testing.T) {
 		},
 	}
 
-	deadline := time.Now().Add(time.Second)
-	for {
-		err := d.Handle(context.Background(), input2, nil)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, sErr.ErrSaturated) {
-			t.Fatalf("second Handle: %v", err)
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for semaphore release after actor became idle")
-		}
-		time.Sleep(10 * time.Millisecond)
+	if err := d.Handle(context.Background(), input2, nil); err != nil {
+		t.Fatalf("second Handle after semaphore release: %v", err)
 	}
+}
+
+func TestDispatcher_SemaphoreLifecycleNoLeak(t *testing.T) {
+	fd := &mockFD{
+		key: "teamA:run-001",
+		cmd: api.Command{Kind: api.CmdRun, Run: &api.RunSpec{RunID: "run-001", ImageRef: "busybox:1.36"}},
+	}
+	act := newLifecycleActor()
+	f := &lifecycleFactory{act: act, bound: make(map[string]actor.Actor)}
+	d := dispatcher.NewDispatcher(fd, f, 1)
+
+	if err := d.Handle(context.Background(), testInput(), nil); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	select {
+	case <-act.idleSignal:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for idle signal")
+	}
+
+	goleak.VerifyNone(t)
 }
 
 func TestIngress_DoesNotPersistInvalidResolvedRun(t *testing.T) {

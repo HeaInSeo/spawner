@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/goleak"
+
 	"github.com/HeaInSeo/spawner/pkg/api"
 	"github.com/HeaInSeo/spawner/pkg/driver"
 	"github.com/HeaInSeo/spawner/pkg/policy"
@@ -214,6 +216,48 @@ func TestK8sActor_CancelAllActiveRuns(t *testing.T) {
 	if cancelCalls == 0 {
 		t.Fatal("expected driver Cancel to be called")
 	}
+}
+
+func TestK8sActor_LoopExitsCleanly_NoLeak(t *testing.T) {
+	sink := &actorTestSink{}
+	drv := &actorTestDriver{
+		waitStarted: make(chan struct{}),
+		waitBlock:   make(chan struct{}),
+	}
+	a := NewK8sActor("spawn-1", drv, 8)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.Loop(ctx)
+	}()
+
+	mustEnqueue(t, a, api.Command{
+		Kind: api.CmdBind,
+		Bind: &api.Bind{SpawnKey: "spawn-1"},
+		Sink: sink,
+	})
+	waitForEventState(t, sink, api.StateStarting, 2*time.Second)
+
+	mustEnqueue(t, a, api.Command{
+		Kind:   api.CmdRun,
+		Run:    &api.RunSpec{RunID: "run-1", ImageRef: "busybox:1.36"},
+		Policy: policy.DefaultPolicyB(5 * time.Second),
+		Sink:   sink,
+	})
+
+	select {
+	case <-drv.waitStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not start within timeout")
+	}
+	waitForEventWithState(t, sink, api.StateRunning, 2*time.Second)
+
+	cancel()
+	<-done
+
+	goleak.VerifyNone(t)
 }
 
 func mustEnqueue(t *testing.T, a *K8sActor, cmd api.Command) {
