@@ -1258,3 +1258,89 @@ func TestDispatcher_ActiveActor_AdditionalCmdRunReturnsSaturated(t *testing.T) {
 		t.Fatalf("expected 1 semaphore slot occupied (by active actor), got %d", len(d.Sem))
 	}
 }
+
+// immediateIdleActor accepts all commands. When CmdRun is enqueued it
+// synchronously fires OnIdle to simulate a run that completes before the
+// dispatcher can call Activate (exercising the Blocker-1 fix).
+type immediateIdleActor struct {
+	mu       sync.Mutex
+	onIdleFn func()
+}
+
+func (a *immediateIdleActor) EnqueueTry(api.Command) bool { return true }
+func (a *immediateIdleActor) EnqueueCtx(_ context.Context, cmd api.Command) bool {
+	if cmd.Kind == api.CmdRun {
+		a.mu.Lock()
+		fn := a.onIdleFn
+		a.mu.Unlock()
+		if fn != nil {
+			fn()
+		}
+	}
+	return true
+}
+func (a *immediateIdleActor) OnIdle(fn func()) {
+	a.mu.Lock()
+	a.onIdleFn = fn
+	a.mu.Unlock()
+}
+func (a *immediateIdleActor) OnTerminate(_ func())   {}
+func (a *immediateIdleActor) Loop(_ context.Context) {}
+
+// TestDispatcher_FastActor_HandleSucceeds verifies that Handle succeeds even
+// when the actor fires OnIdle synchronously during CmdRun enqueue (simulating
+// an extremely fast run). With Activate before CmdRun, the releaseOnce/Unbind
+// fired by OnIdle removes the actor from regBound cleanly, without causing
+// Activate to fail and return a spurious ErrMailboxFull.
+func TestDispatcher_FastActor_HandleSucceeds(t *testing.T) {
+	act := &immediateIdleActor{}
+	f := &lifecycleFactory{act: act, bound: make(map[string]actor.Actor)}
+	fd := &mockFD{
+		key: "team:fast",
+		cmd: api.Command{Kind: api.CmdRun, Run: &api.RunSpec{RunID: "run-fast", ImageRef: "busybox:1.36"}},
+	}
+	d := dispatcher.NewDispatcher(fd, f, 2)
+
+	if err := d.Handle(context.Background(), testInput(), nil); err != nil {
+		t.Fatalf("Handle with fast-completing actor must succeed, got: %v", err)
+	}
+
+	// Semaphore must be released (OnIdle fired releaseOnce during CmdRun enqueue)
+	if len(d.Sem) != 0 {
+		t.Fatalf("semaphore leak after fast actor: len=%d", len(d.Sem))
+	}
+}
+
+// TestDispatcher_NoActor_NonCmdRun_ReturnsInvalidCommand verifies that control
+// commands (CmdCancel, CmdSignal) targeting a non-existent actor return
+// ErrInvalidCommand immediately, without creating a new actor or leaking a
+// semaphore slot.
+func TestDispatcher_NoActor_NonCmdRun_ReturnsInvalidCommand(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  api.Command
+	}{
+		{"CmdCancel", api.Command{Kind: api.CmdCancel, Cancel: &api.CancelReq{RunID: "run-gone"}}},
+		{"CmdSignal", api.Command{Kind: api.CmdSignal, Signal: &api.Signal{RunID: "run-gone"}}},
+		{"CmdUnbind", api.NewUnbindCommand()},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			fd := &mockFD{key: "team:gone", cmd: tc.cmd}
+			// bindErrFactory.Get always returns false (no actor)
+			d := dispatcher.NewDispatcher(fd, &bindErrFactory{}, 2)
+
+			err := d.Handle(context.Background(), testInput(), nil)
+			if !errors.Is(err, sErr.ErrInvalidCommand) {
+				t.Fatalf("expected ErrInvalidCommand for %s with no actor, got %v", tc.name, err)
+			}
+
+			// No semaphore taken
+			if len(d.Sem) != 0 {
+				t.Fatalf("semaphore leaked for %s: len=%d", tc.name, len(d.Sem))
+			}
+		})
+	}
+}

@@ -452,6 +452,13 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 		// commands racing with the actor's idle transition.
 		return sErr.ErrSaturated
 	}
+	if !ok && rr.Cmd.Kind != api.CmdRun {
+		// Only CmdRun may create a new session actor. Control commands
+		// (CmdCancel, CmdSignal, CmdUnbind) without an existing actor would
+		// create a bound-but-idle actor that never transitions to idle,
+		// leaking regBound and the semaphore slot.
+		return fmt.Errorf("%w: no active actor for %s", sErr.ErrInvalidCommand, rr.SpawnKey)
+	}
 	if !ok {
 		// 3) 바인딩 기간 동안만 세마 점유 (non-blocking)
 		select {
@@ -506,8 +513,18 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 					return sErr.ErrMailboxFull
 				}
 
-				// Enqueue the main command before Activate so the actor is never
-				// visible in regBound without its primary work already queued.
+				// Activate before CmdRun: actor is now visible to Get.
+				// Safe because the ErrSaturated guard above blocks any concurrent
+				// CmdRun from entering while we finish setup. Activating first
+				// also prevents a fast-completing run from firing OnIdle→Unbind
+				// before Activate is called, which would cause Activate to fail
+				// and return a spurious ErrMailboxFull on an already-succeeded run.
+				if !d.AF.Activate(rr.SpawnKey, act) {
+					// Actor was cleaned up concurrently (e.g. context cancelled).
+					cleanup()
+					return sErr.ErrMailboxFull
+				}
+
 				rr.Cmd.Sink = s
 				sendCtx := ctx
 				cancelMain := func() {}
@@ -517,12 +534,7 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 				defer cancelMain()
 
 				if ok := act.EnqueueCtx(sendCtx, rr.Cmd); !ok {
-					cleanup()
-					return sErr.ErrMailboxFull
-				}
-
-				if !d.AF.Activate(rr.SpawnKey, act) {
-					// Concurrent cleanup already removed this actor from regBinding.
+					// Undo: cleanup removes actor from regBound via releaseOnce→Unbind
 					cleanup()
 					return sErr.ErrMailboxFull
 				}
