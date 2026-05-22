@@ -69,6 +69,7 @@ linters:
           - lll
           - gocognit
           - gocyclo
+          - goconst
           - unparam
           - depguard
           - prealloc

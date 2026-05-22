@@ -978,11 +978,10 @@ func TestDispatcher_ConcurrentHandle_NoBoundRace(t *testing.T) {
 	wg.Add(N)
 	errs := make([]error, N)
 	for i := 0; i < N; i++ {
-		i := i
-		go func() {
+		go func(idx int) {
 			defer wg.Done()
-			errs[i] = d.Handle(ctx, testInput(), nil)
-		}()
+			errs[idx] = d.Handle(ctx, testInput(), nil)
+		}(i)
 	}
 	wg.Wait()
 
@@ -1329,7 +1328,6 @@ func TestDispatcher_NoActor_NonCmdRun_ReturnsInvalidCommand(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			fd := &mockFD{key: "team:gone", cmd: tc.cmd}
 			// bindErrFactory.Get always returns false (no actor)
