@@ -245,20 +245,39 @@ func TestIngress_RecoverableRuns_DecodesEnvelopeAndSkipsNonRecoverable(t *testin
 	}
 }
 
-func TestIngress_RecoverableRuns_FailsOnMalformedEnvelope(t *testing.T) {
+func TestIngress_RecoverableRuns_SkipsCorruptRecord(t *testing.T) {
 	ctx := context.Background()
 	rs := store.NewInMemoryRunStore()
+
+	// Insert one valid record
+	if err := rs.Enqueue(ctx, recoveryRecord(t, "teamA:run-good", store.StateQueued)); err != nil {
+		t.Fatalf("Enqueue valid record: %v", err)
+	}
+	// Insert one corrupt record (invalid payload)
 	if err := rs.Enqueue(ctx, store.RunRecord{
 		RunID:   "bad-run",
 		State:   store.StateQueued,
 		Payload: []byte("not-json"),
 	}); err != nil {
-		t.Fatalf("Enqueue malformed payload: %v", err)
+		t.Fatalf("Enqueue corrupt record: %v", err)
 	}
 
 	d, _ := newTestDispatcher(rs)
-	if _, err := d.RecoverableRuns(ctx); !errors.Is(err, sErr.ErrInvalidCommand) {
-		t.Fatalf("expected ErrInvalidCommand, got %v", err)
+	recovered, err := d.RecoverableRuns(ctx)
+	if err != nil {
+		t.Fatalf("RecoverableRuns returned unexpected error: %v", err)
+	}
+	if len(recovered) != 1 {
+		t.Fatalf("expected 1 recovered run (corrupt skipped), got %d", len(recovered))
+	}
+	if recovered[0].Record.RunID != "teamA:run-good" {
+		t.Fatalf("expected valid run in result, got %q", recovered[0].Record.RunID)
+	}
+	// Verify corrupt record is NOT in the result
+	for _, rr := range recovered {
+		if rr.Record.RunID == "bad-run" {
+			t.Fatal("corrupt record should have been skipped, but was returned")
+		}
 	}
 }
 

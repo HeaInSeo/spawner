@@ -113,6 +113,10 @@ func (s *InMemoryRunStore) AppendAttempt(_ context.Context, attempt AttemptRecor
 	if err := ValidateAttempt(attempt); err != nil {
 		return err
 	}
+	// AppendAttempt is only for new attempts; the attempt must start in StateQueued.
+	if attempt.State != StateQueued {
+		return fmt.Errorf("%w: AppendAttempt only accepts StateQueued; got %s", ErrInvalidAttempt, attempt.State)
+	}
 	now := time.Now()
 	attempt.CreatedAt = now
 	attempt.UpdatedAt = now

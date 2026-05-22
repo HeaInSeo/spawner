@@ -438,8 +438,8 @@ func TestK8sActor_CancelDuringRun_NoDeadlock(t *testing.T) {
 	})
 
 	sink.waitState(t, api.StateCancelling, 2*time.Second)
-	// runCtx가 취소되면 Wait이 ctx.Err()를 반환 → StateFailed
-	sink.waitState(t, api.StateFailed, 2*time.Second)
+	// runCtx가 취소되면 Wait이 ctx.Err()를 반환 → StateCancelled
+	sink.waitState(t, api.StateCancelled, 2*time.Second)
 
 	cancel()
 	<-done
@@ -475,9 +475,9 @@ func TestK8sActor_WaitFailure_EmitsFailedEvent(t *testing.T) {
 	goleak.VerifyNone(t)
 }
 
-// TestK8sActor_LoopCancel_ActiveRunEmitsFailedEvent: Loop ctx가 취소될 때
-// Wait 중인 active run에 StateFailed 이벤트가 방출된 후 Loop이 정상 종료되어야 한다.
-func TestK8sActor_LoopCancel_ActiveRunEmitsFailedEvent(t *testing.T) {
+// TestK8sActor_LoopCancel_ActiveRunEmitsCancelledEvent: Loop ctx가 취소될 때
+// Wait 중인 active run에 StateCancelled 이벤트가 방출된 후 Loop이 정상 종료되어야 한다.
+func TestK8sActor_LoopCancel_ActiveRunEmitsCancelledEvent(t *testing.T) {
 	sink := newChanSink()
 	drv := &actorTestDriver{
 		waitStarted: make(chan struct{}),
@@ -506,9 +506,9 @@ func TestK8sActor_LoopCancel_ActiveRunEmitsFailedEvent(t *testing.T) {
 	}
 	sink.waitState(t, api.StateRunning, 2*time.Second)
 
-	// Loop ctx 취소 → runCtx도 취소 → Wait이 ctx.Err()를 반환 → StateFailed
+	// Loop ctx 취소 → runCtx도 취소 → Wait이 ctx.Err()를 반환 → StateCancelled
 	cancel()
-	sink.waitState(t, api.StateFailed, 2*time.Second)
+	sink.waitState(t, api.StateCancelled, 2*time.Second)
 
 	<-done
 	goleak.VerifyNone(t)
@@ -547,20 +547,60 @@ func TestK8sActor_CancelFailure_LoopSurvives(t *testing.T) {
 	}
 	sink.waitState(t, api.StateRunning, 2*time.Second)
 
-	// driver.Cancel이 에러를 반환해도 runCtx는 st.cancel()로 취소됨 → StateFailed
+	// driver.Cancel이 에러를 반환해도 runCtx는 st.cancel()로 취소됨 → StateCancelled
 	mustEnqueue(t, a, api.Command{
 		Kind:   api.CmdCancel,
 		Cancel: &api.CancelReq{RunID: "run-1"},
 		Sink:   sink,
 	})
 	sink.waitState(t, api.StateCancelling, 2*time.Second)
-	sink.waitState(t, api.StateFailed, 2*time.Second)
+	sink.waitState(t, api.StateCancelled, 2*time.Second)
 
 	drv.mu.Lock()
 	calls := drv.cancelCalls
 	drv.mu.Unlock()
 	if calls == 0 {
 		t.Fatal("expected driver.Cancel to be called despite returning error")
+	}
+
+	cancel()
+	<-done
+	goleak.VerifyNone(t)
+}
+
+// TestK8sActor_WaitJobFailed_EmitsFailedNotCancelled: driver.Wait가 non-context 에러를 반환하면
+// StateFailed가 방출되어야 한다 (StateCancelled가 아님).
+func TestK8sActor_WaitJobFailed_EmitsFailedNotCancelled(t *testing.T) {
+	sink := newChanSink()
+	drv := &actorTestDriver{waitErr: errors.New("job failed: exit code 1")}
+	a := NewK8sActor("spawn-1", drv, 8)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); a.Loop(ctx) }()
+
+	mustEnqueue(t, a, api.Command{Kind: api.CmdBind, Bind: &api.Bind{SpawnKey: "spawn-1"}, Sink: sink})
+	sink.waitState(t, api.StateStarting, 2*time.Second)
+
+	mustEnqueue(t, a, api.Command{
+		Kind:   api.CmdRun,
+		Run:    &api.RunSpec{RunID: "run-1", ImageRef: "busybox:1.36"},
+		Policy: policy.DefaultPolicyB(time.Second),
+		Sink:   sink,
+	})
+
+	sink.waitState(t, api.StateFailed, 2*time.Second)
+
+	// Make sure StateCancelled was NOT emitted
+	sink.mu.Lock()
+	events := make([]api.Event, len(sink.events))
+	copy(events, sink.events)
+	sink.mu.Unlock()
+	for _, ev := range events {
+		if ev.RunID == "run-1" && ev.State == api.StateCancelled {
+			t.Fatal("expected StateFailed not StateCancelled for job failure")
+		}
 	}
 
 	cancel()

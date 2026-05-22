@@ -115,12 +115,7 @@ func (d *DriverK8s) Wait(ctx context.Context, h driver.Handle) (api.Event, error
 				}, nil
 			}
 			if jobFailed(job) {
-				return api.Event{
-					RunID:   hd.name,
-					When:    time.Now(),
-					State:   api.StateFailed,
-					Message: jobFailureMessage(job),
-				}, nil
+				return api.Event{}, fmt.Errorf("job failed: %s", jobFailureMessage(job))
 			}
 		}
 	}

@@ -52,8 +52,16 @@ func NewK8sActor(key string, drv driver.Driver, mbSize int) *K8sActor {
 	}
 }
 
-func (a *K8sActor) OnIdle(fn func())      { a.onIdle = fn }
-func (a *K8sActor) OnTerminate(fn func()) { a.onTerm = fn }
+func (a *K8sActor) OnIdle(fn func()) {
+	a.mu.Lock()
+	a.onIdle = fn
+	a.mu.Unlock()
+}
+func (a *K8sActor) OnTerminate(fn func()) {
+	a.mu.Lock()
+	a.onTerm = fn
+	a.mu.Unlock()
+}
 
 func (a *K8sActor) EnqueueTry(c api.Command) bool                      { return a.mb.TryEnqueue(c) }
 func (a *K8sActor) EnqueueCtx(ctx context.Context, c api.Command) bool { return a.mb.Enqueue(ctx, c) }
@@ -76,8 +84,11 @@ func (a *K8sActor) Loop(ctx context.Context) {
 		a.mu.Unlock()
 		a.execWG.Wait()
 
-		if a.onTerm != nil {
-			a.onTerm()
+		a.mu.Lock()
+		onTerm := a.onTerm
+		a.mu.Unlock()
+		if onTerm != nil {
+			onTerm()
 		}
 	}()
 
@@ -154,7 +165,17 @@ func (a *K8sActor) Loop(ctx context.Context) {
 
 				emitState(cmd.Sink, a.key, runID, api.StateStarting, "")
 
-				// 개별 실행 컨텍스트(Timeout/Cancel 정책)
+				// 내부 병렬도 슬롯 점유 (non-blocking: respect ctx cancellation)
+				a.execWG.Add(1)
+				select {
+				case a.execSem <- struct{}{}:
+					// acquired: fall through to launch goroutine
+				case <-ctx.Done():
+					a.execWG.Done()
+					return
+				}
+
+				// 개별 실행 컨텍스트(Timeout/Cancel 정책) — created AFTER semaphore acquired
 				var runCtx context.Context
 				var cancel context.CancelFunc
 				if d := cmd.Policy.Timeout; d > 0 {
@@ -163,9 +184,6 @@ func (a *K8sActor) Loop(ctx context.Context) {
 					runCtx, cancel = context.WithCancel(ctx)
 				}
 
-				// 내부 병렬도 슬롯 점유 + active 등록
-				a.execWG.Add(1)
-				a.execSem <- struct{}{}
 				a.mu.Lock()
 				a.active[runID] = struct {
 					h      driver.Handle
@@ -217,7 +235,13 @@ func (a *K8sActor) Loop(ctx context.Context) {
 						}
 					}
 					if err != nil {
-						emitErr(c.Sink, a.key, runID, err)
+						if errors.Is(err, context.Canceled) {
+							// Explicit cancellation (CmdCancel or Loop shutdown)
+							emitState(c.Sink, a.key, runID, api.StateCancelled, "cancelled")
+						} else {
+							// Real failure: job failure, driver error, timeout
+							emitErr(c.Sink, a.key, runID, err)
+						}
 						return
 					}
 					emitState(c.Sink, a.key, runID, api.StateSucceeded, "")

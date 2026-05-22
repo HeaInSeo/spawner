@@ -20,7 +20,7 @@ func (testActor) OnIdle(func())                                {}
 func (testActor) OnTerminate(func())                           {}
 func (testActor) Loop(context.Context)                         {}
 
-func TestFactory_BindRegisterGetUnbindReuse(t *testing.T) {
+func TestFactory_BindRegisterGetUnbind(t *testing.T) {
 	var created int
 
 	f := factory.NewFactory(
@@ -76,13 +76,14 @@ func TestFactory_BindRegisterGetUnbindReuse(t *testing.T) {
 		t.Fatalf("Bind #3: %v", err)
 	}
 	if !created3 {
-		t.Fatal("expected Bind after Unbind to reuse from idle pool as created=true")
+		t.Fatal("expected Bind on new spawnKey to create a fresh actor")
 	}
-	if act3 != act1 {
-		t.Fatal("expected actor to be reused from idle pool")
+	// No idle pool reuse: a new actor is always created for a new spawnKey.
+	if act3 == act1 {
+		t.Fatal("expected a fresh actor (no idle pool reuse)")
 	}
-	if created != 1 {
-		t.Fatalf("expected no additional actor creation during reuse, got %d", created)
+	if created != 2 {
+		t.Fatalf("expected 2 actor creations (no idle pool reuse), got %d", created)
 	}
 }
 

@@ -2,6 +2,7 @@ package imp
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -289,15 +290,12 @@ func TestDriverK8sWait_ReturnsFailedEvent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	ev, err := d.Wait(ctx, handleJob{name: "run-1", ns: "default"})
-	if err != nil {
-		t.Fatalf("Wait: %v", err)
+	_, err := d.Wait(ctx, handleJob{name: "run-1", ns: "default"})
+	if err == nil {
+		t.Fatal("expected Wait to return non-nil error for failed job")
 	}
-	if ev.State != api.StateFailed {
-		t.Fatalf("expected failed event, got %s", ev.State)
-	}
-	if ev.Message != "boom" {
-		t.Fatalf("unexpected failure message: %q", ev.Message)
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("expected error to contain failure message 'boom', got: %v", err)
 	}
 }
 

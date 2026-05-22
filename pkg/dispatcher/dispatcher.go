@@ -8,6 +8,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/HeaInSeo/spawner/pkg/actor"
@@ -29,7 +30,7 @@ type Dispatcher struct {
 	enqueueTimeout time.Duration   // (옵션) EnqueueCtx 타임아웃
 	// ingress boundary
 	runStore         store.RunStore // nil = skip RunStore (backward-compat)
-	backendAvailable bool           // false = backend unreachable; runs held, not dispatched
+	backendAvailable atomic.Bool    // false = backend unreachable; runs held, not dispatched
 	attemptPolicy    ply.AttemptPolicy
 }
 
@@ -77,12 +78,12 @@ func New(fd frontdoor.FrontDoor, af fac.Factory, maxActors int) *Dispatcher {
 
 func NewDispatcher(fd frontdoor.FrontDoor, af fac.Factory, semSize int, opts ...Option) *Dispatcher {
 	d := &Dispatcher{
-		FD:               fd,
-		AF:               af,
-		Sem:              make(chan struct{}, semSize),
-		backendAvailable: true, // assume available unless WithBackendUnavailable is set
-		attemptPolicy:    ply.DefaultAttemptPolicy(),
+		FD:            fd,
+		AF:            af,
+		Sem:           make(chan struct{}, semSize),
+		attemptPolicy: ply.DefaultAttemptPolicy(),
 	}
+	d.backendAvailable.Store(true) // assume available unless WithBackendUnavailable is set
 	for _, o := range opts {
 		o(d)
 	}
@@ -121,14 +122,14 @@ func WithRunStore(s store.RunStore) Option {
 // ASSUMPTION: a health-check loop (not implemented here) calls SetBackendAvailable
 // once connectivity is restored.
 func WithBackendUnavailable() Option {
-	return func(d *Dispatcher) { d.backendAvailable = false }
+	return func(d *Dispatcher) { d.backendAvailable.Store(false) }
 }
 
 // SetBackendAvailable toggles backend availability at runtime.
 // When availability transitions false→true, call Bootstrap() to re-queue
 // held runs.
 func (d *Dispatcher) SetBackendAvailable(available bool) {
-	d.backendAvailable = available
+	d.backendAvailable.Store(available)
 }
 
 // Bootstrap scans the RunStore for runs in StateQueued and StateAdmittedToDag
@@ -172,11 +173,12 @@ func (d *Dispatcher) RecoverableRuns(ctx context.Context) ([]RecoverableRun, err
 	all := append(queued, admitted...)
 	out := make([]RecoverableRun, 0, len(all))
 	for _, r := range all {
+		if !store.IsRecoverable(r.State) {
+			continue
+		}
 		env, err := decodeRunEnvelope(r)
 		if err != nil {
-			return nil, err
-		}
-		if !store.IsRecoverable(r.State) {
+			log.Printf("[bootstrap] skipping corrupt run record %s (state=%s): %v", r.RunID, r.State, err)
 			continue
 		}
 		log.Printf("[bootstrap] recovered run: id=%s state=%s created=%s",
@@ -434,7 +436,7 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 			}
 		}
 
-		if !d.backendAvailable {
+		if !d.backendAvailable.Load() {
 			_ = d.runStore.UpdateState(ctx, logicalRunID, store.StateQueued, store.StateHeld)
 			log.Printf("[ingress] backend unavailable: run %s → held", logicalRunID)
 			return sErr.ErrBackendUnavailable
@@ -448,7 +450,7 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 		// 3) 바인딩 기간 동안만 세마 점유 (non-blocking)
 		select {
 		case d.Sem <- struct{}{}:
-			// 4) idle 워커 가져오거나 새로 생성
+			// 4) 새 액터 생성 또는 이미 바운드된 액터 반환
 			var created bool
 			act, created, err = d.AF.Bind(rr.SpawnKey)
 			if err != nil {
@@ -456,8 +458,8 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 				return err
 			}
 
-			// 5) 새 워커면 루프 시작 (idle에서 꺼냈는데 루프가 이미 돌고 있다면 그대로 OK)
 			if created {
+				// 5) 새 워커면 루프 시작
 				base := d.loopBaseCtx
 				if base == nil {
 					base = ctx
@@ -466,32 +468,35 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 				act.OnIdle(releaseOnce)
 				act.OnTerminate(releaseOnce)
 				go act.Loop(base)
-			}
 
-			// 6) 바운드 등록
-			d.AF.Register(rr.SpawnKey, act)
+				// 6) 바운드 등록
+				d.AF.Register(rr.SpawnKey, act)
 
-			// 7) 액터에 바인드 이벤트 전달
-			bindCmd, err := api.NewBindCommand(&api.Bind{SpawnKey: rr.SpawnKey})
-			if err != nil {
-				d.AF.Unbind(rr.SpawnKey, act)
+				// 7) 액터에 바인드 이벤트 전달
+				bindCmd, err := api.NewBindCommand(&api.Bind{SpawnKey: rr.SpawnKey})
+				if err != nil {
+					d.AF.Unbind(rr.SpawnKey, act)
+					<-d.Sem
+					return err
+				}
+				bindCmd.Sink = s
+
+				sendCtx := ctx
+				cancel := func() {}
+				if d.enqueueTimeout > 0 {
+					sendCtx, cancel = context.WithTimeout(ctx, d.enqueueTimeout)
+				}
+				defer cancel()
+
+				if ok := act.EnqueueCtx(sendCtx, bindCmd); !ok {
+					// 바인드 실패 → 안전 언바인드 + 세마 반납
+					d.AF.Unbind(rr.SpawnKey, act)
+					<-d.Sem
+					return sErr.ErrMailboxFull
+				}
+			} else {
+				// created==false: 다른 goroutine이 이미 바인딩했으므로 세마 반납
 				<-d.Sem
-				return err
-			}
-			bindCmd.Sink = s
-
-			sendCtx := ctx
-			cancel := func() {}
-			if d.enqueueTimeout > 0 {
-				sendCtx, cancel = context.WithTimeout(ctx, d.enqueueTimeout)
-			}
-			defer cancel()
-
-			if ok := act.EnqueueCtx(sendCtx, bindCmd); !ok {
-				// 바인드 실패 → 안전 언바인드 + 세마 반납
-				d.AF.Unbind(rr.SpawnKey, act)
-				<-d.Sem
-				return sErr.ErrMailboxFull
 			}
 
 		default:
