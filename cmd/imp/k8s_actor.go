@@ -113,7 +113,11 @@ func (a *K8sActor) Loop(ctx context.Context) {
 				bk := strings.TrimSpace(cmd.Bind.SpawnKey)
 
 				a.mu.Lock()
-				// 이미 다른 키에 바인딩되어 있으면 거부
+				if a.boundKey == bk {
+					// Already bound to same key: idempotent no-op (duplicate CmdBind)
+					a.mu.Unlock()
+					break
+				}
 				if a.boundKey != "" && a.boundKey != bk {
 					a.mu.Unlock()
 					emitErr(cmd.Sink, a.key, "", errors.New("actor already bound"))
@@ -203,12 +207,11 @@ func (a *K8sActor) Loop(ctx context.Context) {
 						a.execWG.Done()
 
 						if becameIdle {
+							a.mb.Close() // first: prevent new enqueues
 							emitState(c.Sink, a.key, "", api.StateIdle, "unbound")
 							if idleFn != nil {
 								idleFn()
 							}
-							// Fix 3: close mailbox so Loop goroutine terminates (session-based lifecycle)
-							a.mb.Close()
 						}
 					}()
 

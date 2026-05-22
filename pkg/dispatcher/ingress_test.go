@@ -56,12 +56,11 @@ func (m *mockActor) Loop(_ context.Context)                           {}
 
 type mockFactory struct{ act *mockActor }
 
-func (m *mockFactory) Get(_ string) (actor.Actor, bool) { return nil, false }
-func (m *mockFactory) Bind(_ string) (actor.Actor, bool, error) {
-	return m.act, true, nil
-}
-func (m *mockFactory) Register(_ string, _ actor.Actor) {}
-func (m *mockFactory) Unbind(_ string, _ actor.Actor)   {}
+func (m *mockFactory) Get(_ string) (actor.Actor, bool)               { return nil, false }
+func (m *mockFactory) Bind(_ string) (actor.Actor, bool, bool, error) { return m.act, true, true, nil }
+func (m *mockFactory) Activate(_ string)                              {}
+func (m *mockFactory) Register(_ string, _ actor.Actor)               {}
+func (m *mockFactory) Unbind(_ string, _ actor.Actor)                 {}
 
 // newTestDispatcher builds a Dispatcher with a RunStore and mock internals.
 func newTestDispatcher(rs store.RunStore, opts ...dispatcher.Option) (*dispatcher.Dispatcher, *mockActor) {
@@ -541,18 +540,20 @@ func (f *lifecycleFactory) Get(spawnKey string) (actor.Actor, bool) {
 	return act, ok
 }
 
-func (f *lifecycleFactory) Bind(_ string) (actor.Actor, bool, error) {
+func (f *lifecycleFactory) Bind(_ string) (actor.Actor, bool, bool, error) {
 	f.mu.Lock()
 	f.created++
 	f.mu.Unlock()
-	return f.act, true, nil
+	return f.act, true, true, nil
 }
 
-func (f *lifecycleFactory) Register(spawnKey string, act actor.Actor) {
+func (f *lifecycleFactory) Activate(spawnKey string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.bound[spawnKey] = act
+	f.bound[spawnKey] = f.act
 }
+
+func (f *lifecycleFactory) Register(_ string, _ actor.Actor) {}
 
 func (f *lifecycleFactory) Unbind(spawnKey string, act actor.Actor) {
 	f.mu.Lock()
@@ -569,9 +570,10 @@ func (f *lifecycleFactory) Unbind(spawnKey string, act actor.Actor) {
 type bindErrFactory struct{}
 
 func (f *bindErrFactory) Get(_ string) (actor.Actor, bool) { return nil, false }
-func (f *bindErrFactory) Bind(_ string) (actor.Actor, bool, error) {
-	return nil, false, errors.New("bind: backend unavailable")
+func (f *bindErrFactory) Bind(_ string) (actor.Actor, bool, bool, error) {
+	return nil, false, false, errors.New("bind: backend unavailable")
 }
+func (f *bindErrFactory) Activate(_ string)                {}
 func (f *bindErrFactory) Register(_ string, _ actor.Actor) {}
 func (f *bindErrFactory) Unbind(_ string, _ actor.Actor)   {}
 
@@ -592,15 +594,16 @@ type failOnceBinder struct {
 }
 
 func (f *failOnceBinder) Get(_ string) (actor.Actor, bool) { return nil, false }
-func (f *failOnceBinder) Bind(_ string) (actor.Actor, bool, error) {
+func (f *failOnceBinder) Bind(_ string) (actor.Actor, bool, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.called++
 	if f.called == 1 {
-		return nil, false, errors.New("transient bind error")
+		return nil, false, false, errors.New("transient bind error")
 	}
-	return f.act, true, nil
+	return f.act, true, true, nil
 }
+func (f *failOnceBinder) Activate(_ string)                {}
 func (f *failOnceBinder) Register(_ string, _ actor.Actor) {}
 func (f *failOnceBinder) Unbind(_ string, _ actor.Actor)   {}
 
@@ -856,4 +859,150 @@ func recoveryRecord(t *testing.T, logicalRunID string, state store.RunState) sto
 		t.Fatalf("marshal recovery envelope: %v", err)
 	}
 	return store.RunRecord{RunID: logicalRunID, State: state, Payload: payload}
+}
+
+// commandRecordActor records the sequence of command kinds enqueued.
+// It does NOT simulate lifecycle callbacks — only command ordering is verified.
+type commandRecordActor struct {
+	mu       sync.Mutex
+	received []api.CmdKind
+	bindSeen chan struct{} // closed on first CmdBind
+	once     sync.Once
+}
+
+func newCommandRecordActor() *commandRecordActor {
+	return &commandRecordActor{bindSeen: make(chan struct{})}
+}
+
+func (a *commandRecordActor) EnqueueTry(cmd api.Command) bool { return a.record(cmd) }
+func (a *commandRecordActor) EnqueueCtx(_ context.Context, cmd api.Command) bool {
+	return a.record(cmd)
+}
+func (a *commandRecordActor) record(cmd api.Command) bool {
+	a.mu.Lock()
+	a.received = append(a.received, cmd.Kind)
+	a.mu.Unlock()
+	if cmd.Kind == api.CmdBind {
+		a.once.Do(func() { close(a.bindSeen) })
+	}
+	return true
+}
+func (a *commandRecordActor) OnIdle(_ func())        {}
+func (a *commandRecordActor) OnTerminate(_ func())   {}
+func (a *commandRecordActor) Loop(_ context.Context) {}
+
+// concurrentRecordFactory supports the concurrent-Handle race test.
+// It uses a real two-phase approach: regBinding/regBound mirroring FactoryImp.
+type concurrentRecordFactory struct {
+	mu         sync.Mutex
+	act        *commandRecordActor
+	regBinding map[string]*commandRecordActor
+	regBound   map[string]*commandRecordActor
+	created    int
+}
+
+func newConcurrentRecordFactory(act *commandRecordActor) *concurrentRecordFactory {
+	return &concurrentRecordFactory{
+		act:        act,
+		regBinding: make(map[string]*commandRecordActor),
+		regBound:   make(map[string]*commandRecordActor),
+	}
+}
+
+func (f *concurrentRecordFactory) Get(spawnKey string) (actor.Actor, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a, ok := f.regBound[spawnKey]
+	if !ok {
+		return nil, false
+	}
+	return a, true
+}
+
+func (f *concurrentRecordFactory) Bind(spawnKey string) (actor.Actor, bool, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if a, ok := f.regBound[spawnKey]; ok {
+		return a, false, false, nil
+	}
+	if a, ok := f.regBinding[spawnKey]; ok {
+		return a, false, true, nil
+	}
+	f.created++
+	f.regBinding[spawnKey] = f.act
+	return f.act, true, true, nil
+}
+
+func (f *concurrentRecordFactory) Activate(spawnKey string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if a, ok := f.regBinding[spawnKey]; ok {
+		delete(f.regBinding, spawnKey)
+		f.regBound[spawnKey] = a
+	}
+}
+
+func (f *concurrentRecordFactory) Register(_ string, _ actor.Actor) {}
+
+func (f *concurrentRecordFactory) Unbind(spawnKey string, _ actor.Actor) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.regBound, spawnKey)
+	delete(f.regBinding, spawnKey)
+}
+
+// TestDispatcher_ConcurrentHandle_NoBoundRace verifies that when two goroutines
+// call Handle for the same spawnKey concurrently, CmdBind always arrives in the
+// actor's mailbox before any CmdRun, preventing "not bound" errors.
+func TestDispatcher_ConcurrentHandle_NoBoundRace(t *testing.T) {
+	act := newCommandRecordActor()
+	fac := newConcurrentRecordFactory(act)
+
+	fd := &mockFD{
+		key: "teamA:worker-1",
+		cmd: api.Command{Kind: api.CmdRun, Run: &api.RunSpec{RunID: "run-001", ImageRef: "busybox:1.36"}},
+	}
+	d := dispatcher.NewDispatcher(fd, fac, 4)
+
+	ctx := context.Background()
+
+	const N = 20
+	var wg sync.WaitGroup
+	wg.Add(N)
+	errs := make([]error, N)
+	for i := 0; i < N; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			errs[i] = d.Handle(ctx, testInput(), nil)
+		}()
+	}
+	wg.Wait()
+
+	// All Handle calls must succeed (no unexpected errors; ErrSaturated is allowed)
+	for i, err := range errs {
+		if err != nil && !errors.Is(err, sErr.ErrSaturated) {
+			t.Errorf("Handle[%d] unexpected error: %v", i, err)
+		}
+	}
+
+	// CmdBind must have been seen by the actor
+	select {
+	case <-act.bindSeen:
+	default:
+		t.Fatal("CmdBind was never enqueued to the actor")
+	}
+
+	// Verify ordering: the very first command recorded must be CmdBind
+	act.mu.Lock()
+	received := make([]api.CmdKind, len(act.received))
+	copy(received, act.received)
+	act.mu.Unlock()
+
+	if len(received) == 0 {
+		t.Fatal("actor received no commands")
+	}
+	if received[0] != api.CmdBind {
+		t.Fatalf("first command must be CmdBind, got %v (full sequence: %v)", received[0], received)
+	}
 }

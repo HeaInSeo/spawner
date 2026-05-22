@@ -33,53 +33,64 @@ func TestFactory_BindRegisterGetUnbind(t *testing.T) {
 		8,
 	)
 
-	act1, created1, err := f.Bind("tenant:run-1")
+	act1, created1, needsBind1, err := f.Bind("tenant:run-1")
 	if err != nil {
 		t.Fatalf("Bind #1: %v", err)
 	}
 	if !created1 {
 		t.Fatal("expected first Bind to create a new actor")
 	}
+	if !needsBind1 {
+		t.Fatal("expected first Bind to return needsBind=true")
+	}
 	if created != 1 {
 		t.Fatalf("expected 1 actor creation, got %d", created)
 	}
 
-	// Bind now registers atomically, so the actor is immediately visible via Get.
-	got, ok := f.Get("tenant:run-1")
-	if !ok || got != act1 {
-		t.Fatal("registered actor was not returned by Get")
+	// Before Activate: NOT visible via Get
+	if _, ok := f.Get("tenant:run-1"); ok {
+		t.Fatal("actor should not be visible via Get before Activate")
 	}
 
-	act2, created2, err := f.Bind("tenant:run-1")
+	// After Activate: visible via Get
+	f.Activate("tenant:run-1")
+	got, ok := f.Get("tenant:run-1")
+	if !ok || got != act1 {
+		t.Fatal("actor should be visible via Get after Activate")
+	}
+
+	// Second Bind: actor in regBound → created=false, needsBind=false
+	act2, created2, needsBind2, err := f.Bind("tenant:run-1")
 	if err != nil {
 		t.Fatalf("Bind #2: %v", err)
 	}
-	if created2 {
-		t.Fatal("expected Bind on existing spawnKey to reuse the bound actor")
+	if created2 || needsBind2 {
+		t.Fatal("expected created=false, needsBind=false for existing active actor")
 	}
 	if act2 != act1 {
-		t.Fatal("expected the same bound actor to be returned")
+		t.Fatal("expected same actor")
 	}
 
 	f.Unbind("tenant:run-1", act1)
 
+	// After Unbind: not visible
 	if _, ok := f.Get("tenant:run-1"); ok {
-		t.Fatal("actor should not remain bound after Unbind")
+		t.Fatal("should not be visible after Unbind")
 	}
 
-	act3, created3, err := f.Bind("tenant:run-2")
+	// New spawnKey
+	act3, created3, needsBind3, err := f.Bind("tenant:run-2")
 	if err != nil {
 		t.Fatalf("Bind #3: %v", err)
 	}
-	if !created3 {
-		t.Fatal("expected Bind on new spawnKey to create a fresh actor")
+	if !created3 || !needsBind3 {
+		t.Fatal("expected created=true, needsBind=true for new key")
 	}
-	// No idle pool reuse: a new actor is always created for a new spawnKey.
 	if act3 == act1 {
-		t.Fatal("expected a fresh actor (no idle pool reuse)")
+		t.Fatal("expected fresh actor")
 	}
 	if created != 2 {
-		t.Fatalf("expected 2 actor creations (no idle pool reuse), got %d", created)
+		t.Fatalf("expected 2 total creations, got %d", created)
 	}
 }
 
@@ -109,7 +120,7 @@ func TestFactory_ConcurrentBind_SingleActor(t *testing.T) {
 		i := i
 		go func() {
 			defer wg.Done()
-			act, c, err := f.Bind("same-key")
+			act, c, _, err := f.Bind("same-key")
 			if err != nil {
 				t.Errorf("Bind: %v", err)
 				return
@@ -161,11 +172,11 @@ func TestFactory_UnbindWrongActorDoesNothing(t *testing.T) {
 		8,
 	)
 
-	act1, _, err := f.Bind("tenant:run-1")
+	act1, _, _, err := f.Bind("tenant:run-1")
 	if err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	f.Register("tenant:run-1", act1)
+	f.Activate("tenant:run-1")
 
 	wrong := &testActor{id: 999}
 	f.Unbind("tenant:run-1", wrong)
@@ -173,5 +184,85 @@ func TestFactory_UnbindWrongActorDoesNothing(t *testing.T) {
 	got, ok := f.Get("tenant:run-1")
 	if !ok || got != act1 {
 		t.Fatal("wrong actor unbind should not disturb the bound actor")
+	}
+}
+
+func TestFactory_BindingActorNotExposedViaGet(t *testing.T) {
+	f := factory.NewFactory(
+		func(string) driver.Driver { return &testDriver{} },
+		func(string, driver.Driver, int) actor.Actor { return &testActor{id: 1} },
+		8,
+	)
+
+	act, created, needsBind, err := f.Bind("key-1")
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if !created || !needsBind {
+		t.Fatalf("expected created=true needsBind=true, got created=%v needsBind=%v", created, needsBind)
+	}
+
+	// Before Activate: Get must NOT return the actor
+	if _, ok := f.Get("key-1"); ok {
+		t.Fatal("actor in regBinding must not be visible via Get")
+	}
+
+	// Concurrent Bind for same key: created=false, needsBind=true (initializing)
+	act2, created2, needsBind2, err := f.Bind("key-1")
+	if err != nil {
+		t.Fatalf("second Bind: %v", err)
+	}
+	if created2 {
+		t.Fatal("second Bind must not create a new actor")
+	}
+	if !needsBind2 {
+		t.Fatal("second Bind for initializing key must return needsBind=true")
+	}
+	if act2 != act {
+		t.Fatal("second Bind must return same actor")
+	}
+
+	// Activate: now visible to Get
+	f.Activate("key-1")
+	got, ok := f.Get("key-1")
+	if !ok || got != act {
+		t.Fatal("after Activate, actor must be visible via Get")
+	}
+
+	// Third Bind for active key: created=false, needsBind=false
+	act3, created3, needsBind3, err := f.Bind("key-1")
+	if err != nil {
+		t.Fatalf("third Bind: %v", err)
+	}
+	if created3 || needsBind3 {
+		t.Fatalf("third Bind for active key: expected created=false needsBind=false, got created=%v needsBind=%v", created3, needsBind3)
+	}
+	if act3 != act {
+		t.Fatal("third Bind must return same actor")
+	}
+}
+
+func TestFactory_Unbind_CleansRegBinding(t *testing.T) {
+	f := factory.NewFactory(
+		func(string) driver.Driver { return &testDriver{} },
+		func(string, driver.Driver, int) actor.Actor { return &testActor{id: 1} },
+		8,
+	)
+
+	act, _, _, err := f.Bind("key-1")
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	// Unbind before Activate (cleanup on CmdBind enqueue failure)
+	f.Unbind("key-1", act)
+
+	// Should be completely gone: a new Bind must create a fresh actor
+	_, created, needsBind, err := f.Bind("key-1")
+	if err != nil {
+		t.Fatalf("second Bind after cleanup: %v", err)
+	}
+	if !created || !needsBind {
+		t.Fatal("after Unbind of regBinding actor, next Bind must create fresh actor")
 	}
 }

@@ -450,16 +450,15 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 		// 3) 바인딩 기간 동안만 세마 점유 (non-blocking)
 		select {
 		case d.Sem <- struct{}{}:
-			// 4) 새 액터 생성 또는 이미 바운드된 액터 반환
-			var created bool
-			act, created, err = d.AF.Bind(rr.SpawnKey)
+			var created, needsBind bool
+			act, created, needsBind, err = d.AF.Bind(rr.SpawnKey)
 			if err != nil {
-				<-d.Sem // 롤백
+				<-d.Sem
 				return err
 			}
 
 			if created {
-				// 5) 새 워커면 루프 시작
+				// New actor: start Loop, send CmdBind, then Activate (makes visible to Get)
 				base := d.loopBaseCtx
 				if base == nil {
 					base = ctx
@@ -469,7 +468,6 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 				act.OnTerminate(releaseOnce)
 				go act.Loop(base)
 
-				// 6) 액터에 바인드 이벤트 전달
 				bindCmd, err := api.NewBindCommand(&api.Bind{SpawnKey: rr.SpawnKey})
 				if err != nil {
 					d.AF.Unbind(rr.SpawnKey, act)
@@ -478,21 +476,44 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 				}
 				bindCmd.Sink = s
 
-				sendCtx := ctx
-				cancel := func() {}
+				sendCtxBind := ctx
+				cancelBind := func() {}
 				if d.enqueueTimeout > 0 {
-					sendCtx, cancel = context.WithTimeout(ctx, d.enqueueTimeout)
+					sendCtxBind, cancelBind = context.WithTimeout(ctx, d.enqueueTimeout)
 				}
-				defer cancel()
+				defer cancelBind()
 
-				if ok := act.EnqueueCtx(sendCtx, bindCmd); !ok {
-					// 바인드 실패 → 안전 언바인드 + 세마 반납
+				if ok := act.EnqueueCtx(sendCtxBind, bindCmd); !ok {
 					d.AF.Unbind(rr.SpawnKey, act)
 					<-d.Sem
 					return sErr.ErrMailboxFull
 				}
+
+				// Activate only after CmdBind is in the mailbox
+				d.AF.Activate(rr.SpawnKey)
+
+			} else if needsBind {
+				// Actor is initializing (regBinding): release Sem, send CmdBind before rr.Cmd
+				<-d.Sem
+
+				bindCmd, err := api.NewBindCommand(&api.Bind{SpawnKey: rr.SpawnKey})
+				if err != nil {
+					return err
+				}
+				bindCmd.Sink = s
+
+				sendCtxBind := ctx
+				cancelBind := func() {}
+				if d.enqueueTimeout > 0 {
+					sendCtxBind, cancelBind = context.WithTimeout(ctx, d.enqueueTimeout)
+				}
+				defer cancelBind()
+
+				if ok := act.EnqueueCtx(sendCtxBind, bindCmd); !ok {
+					return sErr.ErrMailboxFull
+				}
 			} else {
-				// created==false: 다른 goroutine이 이미 바인딩했으므로 세마 반납
+				// Actor already active (regBound): release Sem, no CmdBind needed
 				<-d.Sem
 			}
 
