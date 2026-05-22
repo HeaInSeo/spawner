@@ -2,6 +2,7 @@ package factory_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/HeaInSeo/spawner/pkg/actor"
@@ -43,12 +44,7 @@ func TestFactory_BindRegisterGetUnbind(t *testing.T) {
 		t.Fatalf("expected 1 actor creation, got %d", created)
 	}
 
-	if _, ok := f.Get("tenant:run-1"); ok {
-		t.Fatal("actor should not be visible via Get before Register")
-	}
-
-	f.Register("tenant:run-1", act1)
-
+	// Bind now registers atomically, so the actor is immediately visible via Get.
 	got, ok := f.Get("tenant:run-1")
 	if !ok || got != act1 {
 		t.Fatal("registered actor was not returned by Get")
@@ -84,6 +80,77 @@ func TestFactory_BindRegisterGetUnbind(t *testing.T) {
 	}
 	if created != 2 {
 		t.Fatalf("expected 2 actor creations (no idle pool reuse), got %d", created)
+	}
+}
+
+func TestFactory_ConcurrentBind_SingleActor(t *testing.T) {
+	var mu sync.Mutex
+	var created int
+
+	f := factory.NewFactory(
+		func(key string) driver.Driver { return &testDriver{} },
+		func(key string, drv driver.Driver, mbSize int) actor.Actor {
+			mu.Lock()
+			created++
+			mu.Unlock()
+			return &testActor{id: created}
+		},
+		8,
+	)
+
+	const N = 10
+	results := make([]struct {
+		act     actor.Actor
+		created bool
+	}, N)
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			act, c, err := f.Bind("same-key")
+			if err != nil {
+				t.Errorf("Bind: %v", err)
+				return
+			}
+			results[i].act = act
+			results[i].created = c
+		}()
+	}
+	wg.Wait()
+
+	// Exactly one actor should be created
+	mu.Lock()
+	total := created
+	mu.Unlock()
+	if total != 1 {
+		t.Fatalf("expected 1 actor creation, got %d", total)
+	}
+
+	// All goroutines should get the same actor
+	var first actor.Actor
+	for _, r := range results {
+		if r.act == nil {
+			continue
+		}
+		if first == nil {
+			first = r.act
+		}
+		if r.act != first {
+			t.Fatal("concurrent Bind returned different actors for same spawnKey")
+		}
+	}
+
+	// Exactly one should have created=true
+	createdCount := 0
+	for _, r := range results {
+		if r.created {
+			createdCount++
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("expected exactly 1 created=true, got %d", createdCount)
 	}
 }
 

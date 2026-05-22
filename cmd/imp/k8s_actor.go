@@ -165,17 +165,7 @@ func (a *K8sActor) Loop(ctx context.Context) {
 
 				emitState(cmd.Sink, a.key, runID, api.StateStarting, "")
 
-				// 내부 병렬도 슬롯 점유 (non-blocking: respect ctx cancellation)
-				a.execWG.Add(1)
-				select {
-				case a.execSem <- struct{}{}:
-					// acquired: fall through to launch goroutine
-				case <-ctx.Done():
-					a.execWG.Done()
-					return
-				}
-
-				// 개별 실행 컨텍스트(Timeout/Cancel 정책) — created AFTER semaphore acquired
+				// 개별 실행 컨텍스트(Timeout/Cancel 정책) — created BEFORE goroutine starts
 				var runCtx context.Context
 				var cancel context.CancelFunc
 				if d := cmd.Policy.Timeout; d > 0 {
@@ -184,6 +174,7 @@ func (a *K8sActor) Loop(ctx context.Context) {
 					runCtx, cancel = context.WithCancel(ctx)
 				}
 
+				// Register cancel in active map BEFORE goroutine starts — CmdCancel must be able to find it
 				a.mu.Lock()
 				a.active[runID] = struct {
 					h      driver.Handle
@@ -191,13 +182,16 @@ func (a *K8sActor) Loop(ctx context.Context) {
 				}{h: nil, cancel: cancel}
 				a.mu.Unlock()
 
+				a.execWG.Add(1)
 				go func(runID string, c api.Command, runCtx context.Context, cancel context.CancelFunc) {
+					var semAcquired bool
 					defer func() {
+						cancel()
+						if semAcquired {
+							<-a.execSem
+						}
 						var becameIdle bool
 						var idleFn func()
-
-						// 종료 처리: cancel 호출, active에서 제거, 슬롯/카운터 반납
-						cancel()
 						a.mu.Lock()
 						delete(a.active, runID)
 						if len(a.active) == 0 && a.boundKey != "" {
@@ -206,7 +200,6 @@ func (a *K8sActor) Loop(ctx context.Context) {
 							idleFn = a.onIdle
 						}
 						a.mu.Unlock()
-						<-a.execSem
 						a.execWG.Done()
 
 						if becameIdle {
@@ -214,8 +207,24 @@ func (a *K8sActor) Loop(ctx context.Context) {
 							if idleFn != nil {
 								idleFn()
 							}
+							// Fix 3: close mailbox so Loop goroutine terminates (session-based lifecycle)
+							a.mb.Close()
 						}
 					}()
+
+					// execSem acquired inside goroutine — Loop is never blocked
+					select {
+					case a.execSem <- struct{}{}:
+						semAcquired = true
+					case <-runCtx.Done():
+						// cancelled before acquiring semaphore
+						if errors.Is(runCtx.Err(), context.Canceled) {
+							emitState(c.Sink, a.key, runID, api.StateCancelled, "cancelled before start")
+						} else {
+							emitErr(c.Sink, a.key, runID, runCtx.Err())
+						}
+						return
+					}
 
 					p, err := a.drv.Prepare(runCtx, *c.Run)
 					if err == nil {

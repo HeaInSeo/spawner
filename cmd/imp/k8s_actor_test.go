@@ -10,6 +10,7 @@ import (
 
 	"go.uber.org/goleak"
 
+	"github.com/HeaInSeo/spawner/pkg/actor"
 	"github.com/HeaInSeo/spawner/pkg/api"
 	"github.com/HeaInSeo/spawner/pkg/driver"
 	"github.com/HeaInSeo/spawner/pkg/policy"
@@ -605,6 +606,117 @@ func TestK8sActor_WaitJobFailed_EmitsFailedNotCancelled(t *testing.T) {
 
 	cancel()
 	<-done
+	goleak.VerifyNone(t)
+}
+
+// TestK8sActor_ExecSemSaturated_LoopProcessesCancel verifies that when execSem
+// is saturated (all slots occupied), the actor Loop can still process CmdCancel
+// without deadlock.
+func TestK8sActor_ExecSemSaturated_LoopProcessesCancel(t *testing.T) {
+	sink := newChanSink()
+
+	drv := &actorTestDriver{
+		waitStarted: make(chan struct{}),
+		waitBlock:   make(chan struct{}),
+	}
+	// Create actor with execSem size 1 so run-1 saturates it
+	a := &K8sActor{
+		key:     "spawn-1",
+		drv:     drv,
+		mb:      actor.NewMailbox[api.Command](8),
+		execSem: make(chan struct{}, 1),
+		active: make(map[string]struct {
+			h      driver.Handle
+			cancel context.CancelFunc
+		}),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); a.Loop(ctx) }()
+
+	mustEnqueue(t, a, api.Command{Kind: api.CmdBind, Bind: &api.Bind{SpawnKey: "spawn-1"}, Sink: sink})
+	sink.waitState(t, api.StateStarting, 2*time.Second)
+
+	// run-1: will occupy the single execSem slot and block in Wait
+	mustEnqueue(t, a, api.Command{
+		Kind:   api.CmdRun,
+		Run:    &api.RunSpec{RunID: "run-1", ImageRef: "busybox:1.36"},
+		Policy: policy.DefaultPolicyB(5 * time.Second),
+		Sink:   sink,
+	})
+	select {
+	case <-drv.waitStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run-1 Wait did not start within timeout")
+	}
+
+	// run-2: Loop must accept this without blocking (execSem is full but Loop doesn't wait)
+	mustEnqueue(t, a, api.Command{
+		Kind:   api.CmdRun,
+		Run:    &api.RunSpec{RunID: "run-2", ImageRef: "busybox:1.36"},
+		Policy: policy.DefaultPolicyB(5 * time.Second),
+		Sink:   sink,
+	})
+
+	// Cancel run-2 — Loop must process this without deadlock
+	mustEnqueue(t, a, api.Command{
+		Kind:   api.CmdCancel,
+		Cancel: &api.CancelReq{RunID: "run-2"},
+		Sink:   sink,
+	})
+
+	// run-2 must get StateCancelled (cancelled before acquiring semaphore or during start)
+	sink.waitFor(t, func(ev api.Event) bool {
+		return ev.RunID == "run-2" && ev.State == api.StateCancelled
+	}, 2*time.Second)
+
+	// Release run-1
+	close(drv.waitBlock)
+	sink.waitFor(t, func(ev api.Event) bool {
+		return ev.RunID == "run-1" && (ev.State == api.StateSucceeded || ev.State == api.StateFailed || ev.State == api.StateCancelled)
+	}, 2*time.Second)
+
+	cancel()
+	<-done
+	goleak.VerifyNone(t)
+}
+
+// TestK8sActor_RunComplete_LoopExits verifies that after all runs complete the
+// actor becomes idle, closes its mailbox, and the Loop goroutine terminates.
+func TestK8sActor_RunComplete_LoopExits(t *testing.T) {
+	sink := newChanSink()
+	drv := &actorTestDriver{} // no errors, no blocking
+	a := NewK8sActor("spawn-1", drv, 8)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); a.Loop(ctx) }()
+
+	// Set up OnIdle — the actor will call mb.Close() on idle regardless of this
+	a.OnIdle(func() {})
+
+	mustEnqueue(t, a, api.Command{Kind: api.CmdBind, Bind: &api.Bind{SpawnKey: "spawn-1"}, Sink: sink})
+	sink.waitState(t, api.StateStarting, 2*time.Second)
+
+	mustEnqueue(t, a, api.Command{
+		Kind:   api.CmdRun,
+		Run:    &api.RunSpec{RunID: "run-1", ImageRef: "busybox:1.36"},
+		Policy: policy.DefaultPolicyB(5 * time.Second),
+		Sink:   sink,
+	})
+	sink.waitState(t, api.StateSucceeded, 2*time.Second)
+
+	// After run completes, actor becomes idle and mailbox is closed → Loop exits
+	select {
+	case <-done:
+		// success: Loop terminated
+	case <-time.After(2 * time.Second):
+		t.Fatal("Loop goroutine did not terminate after actor became idle")
+	}
+
 	goleak.VerifyNone(t)
 }
 

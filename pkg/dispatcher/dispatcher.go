@@ -469,10 +469,7 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 				act.OnTerminate(releaseOnce)
 				go act.Loop(base)
 
-				// 6) 바운드 등록
-				d.AF.Register(rr.SpawnKey, act)
-
-				// 7) 액터에 바인드 이벤트 전달
+				// 6) 액터에 바인드 이벤트 전달
 				bindCmd, err := api.NewBindCommand(&api.Bind{SpawnKey: rr.SpawnKey})
 				if err != nil {
 					d.AF.Unbind(rr.SpawnKey, act)
@@ -504,7 +501,7 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 		}
 	}
 
-	// 8) 본 작업 커맨드 전송
+	// 7) 본 작업 커맨드 전송
 	rr.Cmd.Sink = s
 
 	sendCtx := ctx

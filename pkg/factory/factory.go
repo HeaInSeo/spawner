@@ -16,12 +16,10 @@ type Factory interface {
 	// 현재 "바운드된" 액터(있다면)를 조회. (재활용 모드에선 regBound를 우선 확인)
 	Get(spawnKey string) (actor.Actor, bool)
 
-	// (a) 이미 해당 spawnKey로 바운드된 액터가 있으면 그걸 반환(created=false),
-	// (b) 아니면 새로 생성해 반환(created=true).
-	// 이 단계에서는 등록하지 않는다(Dispatcher가 Register 호출).
-
+	// Bind returns the already-bound actor for spawnKey (created=false),
+	// or atomically creates and registers a new one (created=true).
 	Bind(spawnKey string) (act actor.Actor, created bool, err error)
-	// Register : spawnKey ↔ actor 바인딩 등록
+	// Register is a no-op; Bind now handles registration atomically.
 	Register(spawnKey string, act actor.Actor)
 	// Unbind : 바인딩 해제
 	Unbind(spawnKey string, act actor.Actor)
@@ -63,39 +61,23 @@ func (f *FactoryImp) Get(spawnKey string) (actor.Actor, bool) {
 
 // ===== 재활용 경로 =====
 
-// Bind 은 현재 바운드된 액터가 있으면 그걸 반환(created=false).
-// 없으면 새로 생성(created=true)하여 반환한다.
-// 주의: 여기서는 regBound에 등록하지 않는다. (Dispatcher가 Register를 호출)
+// Bind checks for an existing bound actor, or atomically creates and registers a new one.
 func (f *FactoryImp) Bind(spawnKey string) (actor.Actor, bool, error) {
-	// fast path: 이미 바운드되어 있다면 그걸 반환
-	f.mu.RLock()
-	if a, ok := f.regBound[spawnKey]; ok {
-		f.mu.RUnlock()
-		return a, false, nil
-	}
-	f.mu.RUnlock()
-
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// 경합 재확인
 	if a, ok := f.regBound[spawnKey]; ok {
 		return a, false, nil
 	}
 
-	// 항상 새로 생성
 	drv := f.makeDrv(spawnKey)
 	act := f.makeActor(spawnKey, drv, f.mbSize)
-	// 등록은 Dispatcher.Register가 수행
+	f.regBound[spawnKey] = act // atomic: creation + registration under same lock
 	return act, true, nil
 }
 
-// Register 는 바인딩 등록을 수행한다.
-func (f *FactoryImp) Register(spawnKey string, act actor.Actor) {
-	f.mu.Lock()
-	f.regBound[spawnKey] = act
-	f.mu.Unlock()
-}
+// Register is a no-op; Bind handles registration atomically.
+func (f *FactoryImp) Register(_ string, _ actor.Actor) {}
 
 // Unbind 는 바인딩을 해제한다.
 func (f *FactoryImp) Unbind(spawnKey string, act actor.Actor) {

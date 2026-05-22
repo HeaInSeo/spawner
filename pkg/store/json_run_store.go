@@ -208,6 +208,9 @@ func (s *JsonRunStore) AppendAttempt(_ context.Context, attempt AttemptRecord) e
 	if attempt.State != StateQueued {
 		return fmt.Errorf("%w: AppendAttempt only accepts StateQueued; got %s", ErrInvalidAttempt, attempt.State)
 	}
+	if IsTerminal(r.State) {
+		return fmt.Errorf("%w: cannot append attempt to run in terminal state %s", ErrInvalidAttempt, r.State)
+	}
 	now := time.Now()
 	attempt.CreatedAt = now
 	attempt.UpdatedAt = now
