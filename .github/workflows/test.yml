@@ -15,10 +15,6 @@ on:
 permissions:
   contents: read
 
-# Node.js 24 opt-in (enforcement: 2026-06-02)
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 concurrency:
   group: test-${{ github.ref }}
   cancel-in-progress: true
@@ -29,10 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -48,7 +44,7 @@ jobs:
         run: make coverage
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: spawner-coverage
           path: reports/
