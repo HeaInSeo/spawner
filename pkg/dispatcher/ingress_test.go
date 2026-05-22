@@ -1149,12 +1149,11 @@ func waitLoopExit(t *testing.T, act *ctxAwareActor) {
 	}
 }
 
-// TestDispatcher_CreatedActor_CmdBindFail_LoopTerminates verifies that when
-// CmdBind enqueue fails, cleanup() stops the Loop goroutine and releases the
-// semaphore. Also exercises double-release safety: both cleanup's releaseOnce
-// and the actor's own OnTerminate path call releaseOnce — sync.Once ensures
-// exactly one release.
-func TestDispatcher_CreatedActor_CmdBindFail_LoopTerminates(t *testing.T) {
+// TestDispatcher_CreatedActor_CmdBindFail_NoLeak verifies that when CmdBind
+// enqueue fails, cleanup() releases the semaphore and the actor is not added
+// to regBound. The Loop goroutine is never started in this path (Loop starts
+// only after Activate), so there is no goroutine to wait for.
+func TestDispatcher_CreatedActor_CmdBindFail_NoLeak(t *testing.T) {
 	// Actor rejects ALL commands (CmdBind enqueue will fail immediately)
 	act := newCtxAwareActor() // empty accept set
 	f := &lifecycleFactory{act: act, bound: make(map[string]actor.Actor)}
@@ -1169,24 +1168,22 @@ func TestDispatcher_CreatedActor_CmdBindFail_LoopTerminates(t *testing.T) {
 		t.Fatalf("expected ErrMailboxFull when CmdBind enqueue fails, got %v", err)
 	}
 
-	// Loop goroutine must exit (stopLoop was called by cleanup)
-	waitLoopExit(t, act)
-
-	// Semaphore must be released (sync.Once prevents double-release)
+	// Semaphore must be released
 	if len(d.Sem) != 0 {
 		t.Fatalf("semaphore leak after CmdBind failure: len=%d", len(d.Sem))
 	}
 
-	// Actor must not be in regBound
+	// Actor must not be in regBound (Activate never called)
 	if _, ok := f.Get("team:worker-bind-fail"); ok {
 		t.Fatal("actor must not be in regBound after CmdBind failure")
 	}
 }
 
-// TestDispatcher_CreatedActor_RrCmdFail_LoopTerminates verifies that when
-// CmdBind succeeds but rr.Cmd enqueue fails, cleanup() stops the Loop goroutine
-// and releases the semaphore. Double-release safety is exercised as above.
-func TestDispatcher_CreatedActor_RrCmdFail_LoopTerminates(t *testing.T) {
+// TestDispatcher_CreatedActor_RrCmdFail_NoLeak verifies that when CmdBind
+// succeeds but rr.Cmd enqueue fails, cleanup() releases the semaphore and the
+// actor is not added to regBound. Loop is never started (starts only after
+// Activate), so no goroutine leak is possible in this path.
+func TestDispatcher_CreatedActor_RrCmdFail_NoLeak(t *testing.T) {
 	// Actor accepts CmdBind but rejects CmdRun
 	act := newCtxAwareActor(api.CmdBind)
 	f := &lifecycleFactory{act: act, bound: make(map[string]actor.Actor)}
@@ -1200,9 +1197,6 @@ func TestDispatcher_CreatedActor_RrCmdFail_LoopTerminates(t *testing.T) {
 	if !errors.Is(err, sErr.ErrMailboxFull) {
 		t.Fatalf("expected ErrMailboxFull when rr.Cmd enqueue fails, got %v", err)
 	}
-
-	// Loop goroutine must exit
-	waitLoopExit(t, act)
 
 	// Semaphore must be released
 	if len(d.Sem) != 0 {
@@ -1221,7 +1215,6 @@ func TestDispatcher_CreatedActor_RrCmdFail_LoopTerminates(t *testing.T) {
 // with the actor's idle transition ("not bound" error).
 func TestDispatcher_ActiveActor_AdditionalCmdRunReturnsSaturated(t *testing.T) {
 	loopCtx, cancelLoop := context.WithCancel(context.Background())
-	defer cancelLoop()
 
 	// Actor accepts both CmdBind and CmdRun so the first Handle succeeds
 	act := newCtxAwareActor(api.CmdBind, api.CmdRun)
@@ -1232,31 +1225,41 @@ func TestDispatcher_ActiveActor_AdditionalCmdRunReturnsSaturated(t *testing.T) {
 	}
 	d := dispatcher.NewDispatcher(fd, f, 2, dispatcher.WithLoopBaseCtx(loopCtx))
 
-	// First Handle: creates actor, succeeds
+	// First Handle: creates actor, Loop starts after Activate
 	if err := d.Handle(context.Background(), testInput(), nil); err != nil {
+		cancelLoop()
 		t.Fatalf("first Handle: %v", err)
 	}
 
 	// Actor should now be in regBound
 	if _, ok := f.Get("team:session"); !ok {
+		cancelLoop()
 		t.Fatal("actor should be in regBound after successful first Handle")
 	}
 
 	// Second Handle with CmdRun on same spawnKey: session semantics → ErrSaturated
 	err := d.Handle(context.Background(), testInput(), nil)
 	if !errors.Is(err, sErr.ErrSaturated) {
+		cancelLoop()
 		t.Fatalf("expected ErrSaturated for second CmdRun on active session actor, got %v", err)
 	}
 
 	// Actor must still be in regBound (not disturbed by ErrSaturated)
 	if _, ok := f.Get("team:session"); !ok {
+		cancelLoop()
 		t.Fatal("actor should remain in regBound after ErrSaturated")
 	}
 
-	// Semaphore must not be leaked (ErrSaturated path never takes the semaphore)
+	// Semaphore still occupied (Loop is running)
 	if len(d.Sem) != 1 {
+		cancelLoop()
 		t.Fatalf("expected 1 semaphore slot occupied (by active actor), got %d", len(d.Sem))
 	}
+
+	// Shut down the Loop goroutine and wait for it to exit cleanly.
+	// Loop exit fires onTermFn (releaseOnce → Unbind + <-Sem).
+	cancelLoop()
+	waitLoopExit(t, act)
 }
 
 // immediateIdleActor accepts all commands. When CmdRun is enqueued it

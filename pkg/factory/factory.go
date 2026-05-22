@@ -22,8 +22,8 @@ type Factory interface {
 
 	// Activate moves act from regBinding to regBound (visible to Get).
 	// Returns false if act is no longer in regBinding (stale or cleaned up).
-	// Must be called only after both CmdBind and the main command have been
-	// successfully enqueued.
+	// Call only after all setup commands have been enqueued and before starting
+	// the actor's Loop goroutine.
 	Activate(spawnKey string, act actor.Actor) bool
 
 	// Register is a no-op kept for interface compatibility.

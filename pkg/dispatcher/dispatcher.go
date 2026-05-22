@@ -471,9 +471,21 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 			}
 
 			if created {
-				// New actor: start Loop, enqueue CmdBind, enqueue rr.Cmd, then Activate.
-				// Activate is last — actor becomes visible to Get only after both
-				// commands are safely in the mailbox.
+				// New actor setup — order matters for correctness:
+				//   1. Enqueue CmdBind (into buffered mailbox, Loop not yet running)
+				//   2. Enqueue CmdRun  (same — no control commands can slip between)
+				//   3. Activate        (actor enters regBound only after both are queued)
+				//   4. go act.Loop     (Loop starts last; cannot race Activate or enqueues)
+				//
+				// This prevents three races simultaneously:
+				//   a) Control commands (CmdUnbind) cannot arrive between CmdBind and
+				//      CmdRun because the Loop goroutine hasn't started yet.
+				//   b) Fast drivers cannot fire OnIdle→Unbind before Activate (Loop not
+				//      running, so no run can complete during setup).
+				//   c) Concurrent Handle callers cannot see the actor via Get until
+				//      Activate, and CmdRun is already guarded by ErrSaturated.
+				//
+				// Requires mailbox capacity >= 2 (production default: 128).
 				base := d.loopBaseCtx
 				if base == nil {
 					base = ctx
@@ -484,15 +496,13 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 				act.OnIdle(releaseOnce)
 				act.OnTerminate(releaseOnce)
 
-				// cleanup stops the Loop goroutine and releases factory/semaphore.
-				// Uses releaseOnce so it is safe to call alongside the actor's own
-				// OnIdle/OnTerminate path — sync.Once prevents double-release.
+				// cleanup cancels the Loop context and releases factory+semaphore.
+				// Idempotent via releaseOnce (sync.Once); safe to call alongside
+				// the actor's own OnIdle/OnTerminate path.
 				cleanup := func() {
 					stopLoop()
 					releaseOnce()
 				}
-
-				go act.Loop(loopCtx)
 
 				bindCmd, err := api.NewBindCommand(&api.Bind{SpawnKey: rr.SpawnKey})
 				if err != nil {
@@ -513,18 +523,6 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 					return sErr.ErrMailboxFull
 				}
 
-				// Activate before CmdRun: actor is now visible to Get.
-				// Safe because the ErrSaturated guard above blocks any concurrent
-				// CmdRun from entering while we finish setup. Activating first
-				// also prevents a fast-completing run from firing OnIdle→Unbind
-				// before Activate is called, which would cause Activate to fail
-				// and return a spurious ErrMailboxFull on an already-succeeded run.
-				if !d.AF.Activate(rr.SpawnKey, act) {
-					// Actor was cleaned up concurrently (e.g. context cancelled).
-					cleanup()
-					return sErr.ErrMailboxFull
-				}
-
 				rr.Cmd.Sink = s
 				sendCtx := ctx
 				cancelMain := func() {}
@@ -534,10 +532,16 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 				defer cancelMain()
 
 				if ok := act.EnqueueCtx(sendCtx, rr.Cmd); !ok {
-					// Undo: cleanup removes actor from regBound via releaseOnce→Unbind
 					cleanup()
 					return sErr.ErrMailboxFull
 				}
+
+				if !d.AF.Activate(rr.SpawnKey, act) {
+					cleanup()
+					return sErr.ErrMailboxFull
+				}
+
+				go act.Loop(loopCtx)
 
 				// rr.Cmd already enqueued above; skip the common enqueue below.
 				goto admitted
