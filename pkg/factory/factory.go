@@ -20,9 +20,11 @@ type Factory interface {
 	//   created=false, needsBind=false — actor found in regBound (already active)
 	Bind(spawnKey string) (act actor.Actor, created bool, needsBind bool, err error)
 
-	// Activate moves the actor from regBinding to regBound (visible to Get).
-	// Must be called only after CmdBind has been successfully enqueued.
-	Activate(spawnKey string)
+	// Activate moves act from regBinding to regBound (visible to Get).
+	// Returns false if act is no longer in regBinding (stale or cleaned up).
+	// Must be called only after both CmdBind and the main command have been
+	// successfully enqueued.
+	Activate(spawnKey string, act actor.Actor) bool
 
 	// Register is a no-op kept for interface compatibility.
 	Register(spawnKey string, act actor.Actor)
@@ -78,14 +80,18 @@ func (f *FactoryImp) Bind(spawnKey string) (actor.Actor, bool, bool, error) {
 	return act, true, true, nil // newly created
 }
 
-// Activate moves the actor from regBinding to regBound (visible to Get).
-func (f *FactoryImp) Activate(spawnKey string) {
+// Activate moves act from regBinding to regBound.
+// Returns false if act is not the current regBinding entry (stale or cleaned up).
+func (f *FactoryImp) Activate(spawnKey string, act actor.Actor) bool {
 	f.mu.Lock()
-	if a, ok := f.regBinding[spawnKey]; ok {
-		delete(f.regBinding, spawnKey)
-		f.regBound[spawnKey] = a
+	defer f.mu.Unlock()
+	cur, ok := f.regBinding[spawnKey]
+	if !ok || cur != act {
+		return false
 	}
-	f.mu.Unlock()
+	delete(f.regBinding, spawnKey)
+	f.regBound[spawnKey] = act
+	return true
 }
 
 // Register is a no-op; kept for interface compatibility.

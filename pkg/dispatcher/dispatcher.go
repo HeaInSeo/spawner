@@ -458,7 +458,9 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 			}
 
 			if created {
-				// New actor: start Loop, send CmdBind, then Activate (makes visible to Get)
+				// New actor: start Loop, enqueue CmdBind, enqueue rr.Cmd, then Activate.
+				// Activate is last — actor becomes visible to Get only after both
+				// commands are safely in the mailbox.
 				base := d.loopBaseCtx
 				if base == nil {
 					base = ctx
@@ -468,10 +470,14 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 				act.OnTerminate(releaseOnce)
 				go act.Loop(base)
 
-				bindCmd, err := api.NewBindCommand(&api.Bind{SpawnKey: rr.SpawnKey})
-				if err != nil {
+				cleanup := func() {
 					d.AF.Unbind(rr.SpawnKey, act)
 					<-d.Sem
+				}
+
+				bindCmd, err := api.NewBindCommand(&api.Bind{SpawnKey: rr.SpawnKey})
+				if err != nil {
+					cleanup()
 					return err
 				}
 				bindCmd.Sink = s
@@ -484,36 +490,43 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 				defer cancelBind()
 
 				if ok := act.EnqueueCtx(sendCtxBind, bindCmd); !ok {
-					d.AF.Unbind(rr.SpawnKey, act)
-					<-d.Sem
+					cleanup()
 					return sErr.ErrMailboxFull
 				}
 
-				// Activate only after CmdBind is in the mailbox
-				d.AF.Activate(rr.SpawnKey)
+				// Enqueue the main command before Activate so the actor is never
+				// visible in regBound without its primary work already queued.
+				rr.Cmd.Sink = s
+				sendCtx := ctx
+				cancelMain := func() {}
+				if d.enqueueTimeout > 0 {
+					sendCtx, cancelMain = context.WithTimeout(ctx, d.enqueueTimeout)
+				}
+				defer cancelMain()
+
+				if ok := act.EnqueueCtx(sendCtx, rr.Cmd); !ok {
+					cleanup()
+					return sErr.ErrMailboxFull
+				}
+
+				if !d.AF.Activate(rr.SpawnKey, act) {
+					// Concurrent cleanup already removed this actor from regBinding.
+					cleanup()
+					return sErr.ErrMailboxFull
+				}
+
+				// rr.Cmd already enqueued above; skip the common enqueue below.
+				goto admitted
 
 			} else if needsBind {
-				// Actor is initializing (regBinding): release Sem, send CmdBind before rr.Cmd
+				// Actor is initializing in regBinding (owned by another goroutine).
+				// Injecting commands into a non-owned actor risks lifecycle races
+				// with the owner's cleanup path — return ErrSaturated so the caller
+				// can retry once the actor has been fully activated.
 				<-d.Sem
-
-				bindCmd, err := api.NewBindCommand(&api.Bind{SpawnKey: rr.SpawnKey})
-				if err != nil {
-					return err
-				}
-				bindCmd.Sink = s
-
-				sendCtxBind := ctx
-				cancelBind := func() {}
-				if d.enqueueTimeout > 0 {
-					sendCtxBind, cancelBind = context.WithTimeout(ctx, d.enqueueTimeout)
-				}
-				defer cancelBind()
-
-				if ok := act.EnqueueCtx(sendCtxBind, bindCmd); !ok {
-					return sErr.ErrMailboxFull
-				}
+				return sErr.ErrSaturated
 			} else {
-				// Actor already active (regBound): release Sem, no CmdBind needed
+				// Actor already active (regBound): release Sem, no CmdBind needed.
 				<-d.Sem
 			}
 
@@ -522,20 +535,22 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 		}
 	}
 
-	// 7) 본 작업 커맨드 전송
-	rr.Cmd.Sink = s
+	// 7) 본 작업 커맨드 전송 (created 경로는 위에서 이미 전송 후 goto admitted)
+	{
+		rr.Cmd.Sink = s
+		sendCtx := ctx
+		cancel := func() {}
+		if d.enqueueTimeout > 0 {
+			sendCtx, cancel = context.WithTimeout(ctx, d.enqueueTimeout)
+		}
+		defer cancel()
 
-	sendCtx := ctx
-	cancel := func() {}
-	if d.enqueueTimeout > 0 {
-		sendCtx, cancel = context.WithTimeout(ctx, d.enqueueTimeout)
+		if ok := act.EnqueueCtx(sendCtx, rr.Cmd); !ok {
+			return sErr.ErrMailboxFull
+		}
 	}
-	defer cancel()
 
-	if ok := act.EnqueueCtx(sendCtx, rr.Cmd); !ok {
-		return sErr.ErrMailboxFull
-	}
-
+admitted:
 	// ── admitted: queued → admitted-to-dag ────────────────────────────────────
 	if rr.Cmd.Kind == api.CmdRun && d.runStore != nil && logicalRunID != "" {
 		if err := d.runStore.UpdateState(ctx, logicalRunID, store.StateQueued, store.StateAdmittedToDag); err != nil {

@@ -58,7 +58,7 @@ type mockFactory struct{ act *mockActor }
 
 func (m *mockFactory) Get(_ string) (actor.Actor, bool)               { return nil, false }
 func (m *mockFactory) Bind(_ string) (actor.Actor, bool, bool, error) { return m.act, true, true, nil }
-func (m *mockFactory) Activate(_ string)                              {}
+func (m *mockFactory) Activate(_ string, _ actor.Actor) bool          { return true }
 func (m *mockFactory) Register(_ string, _ actor.Actor)               {}
 func (m *mockFactory) Unbind(_ string, _ actor.Actor)                 {}
 
@@ -547,10 +547,14 @@ func (f *lifecycleFactory) Bind(_ string) (actor.Actor, bool, bool, error) {
 	return f.act, true, true, nil
 }
 
-func (f *lifecycleFactory) Activate(spawnKey string) {
+func (f *lifecycleFactory) Activate(spawnKey string, act actor.Actor) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.bound[spawnKey] = f.act
+	if act != f.act {
+		return false
+	}
+	f.bound[spawnKey] = act
+	return true
 }
 
 func (f *lifecycleFactory) Register(_ string, _ actor.Actor) {}
@@ -573,9 +577,9 @@ func (f *bindErrFactory) Get(_ string) (actor.Actor, bool) { return nil, false }
 func (f *bindErrFactory) Bind(_ string) (actor.Actor, bool, bool, error) {
 	return nil, false, false, errors.New("bind: backend unavailable")
 }
-func (f *bindErrFactory) Activate(_ string)                {}
-func (f *bindErrFactory) Register(_ string, _ actor.Actor) {}
-func (f *bindErrFactory) Unbind(_ string, _ actor.Actor)   {}
+func (f *bindErrFactory) Activate(_ string, _ actor.Actor) bool { return true }
+func (f *bindErrFactory) Register(_ string, _ actor.Actor)      {}
+func (f *bindErrFactory) Unbind(_ string, _ actor.Actor)        {}
 
 // rejectEnqueueActor: EnqueueCtx 항상 false → ErrMailboxFull 유도
 type rejectEnqueueActor struct{}
@@ -603,9 +607,9 @@ func (f *failOnceBinder) Bind(_ string) (actor.Actor, bool, bool, error) {
 	}
 	return f.act, true, true, nil
 }
-func (f *failOnceBinder) Activate(_ string)                {}
-func (f *failOnceBinder) Register(_ string, _ actor.Actor) {}
-func (f *failOnceBinder) Unbind(_ string, _ actor.Actor)   {}
+func (f *failOnceBinder) Activate(_ string, _ actor.Actor) bool { return true }
+func (f *failOnceBinder) Register(_ string, _ actor.Actor)      {}
+func (f *failOnceBinder) Unbind(_ string, _ actor.Actor)        {}
 
 // dualSignalActor: OnIdle + OnTerminate 모두 등록하고, CmdRun 수신 시 두 콜백을 순서대로 호출.
 // releaseOnce(sync.Once)가 두 번째 호출을 막는지 검증하기 위해 사용.
@@ -933,13 +937,16 @@ func (f *concurrentRecordFactory) Bind(spawnKey string) (actor.Actor, bool, bool
 	return f.act, true, true, nil
 }
 
-func (f *concurrentRecordFactory) Activate(spawnKey string) {
+func (f *concurrentRecordFactory) Activate(spawnKey string, act actor.Actor) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if a, ok := f.regBinding[spawnKey]; ok {
-		delete(f.regBinding, spawnKey)
-		f.regBound[spawnKey] = a
+	cur, ok := f.regBinding[spawnKey]
+	if !ok || cur != act {
+		return false
 	}
+	delete(f.regBinding, spawnKey)
+	f.regBound[spawnKey] = cur
+	return true
 }
 
 func (f *concurrentRecordFactory) Register(_ string, _ actor.Actor) {}
@@ -1004,5 +1011,88 @@ func TestDispatcher_ConcurrentHandle_NoBoundRace(t *testing.T) {
 	}
 	if received[0] != api.CmdBind {
 		t.Fatalf("first command must be CmdBind, got %v (full sequence: %v)", received[0], received)
+	}
+}
+
+// partialRejectActor accepts CmdBind but rejects all other commands.
+// Used to simulate CmdBind-succeeds-but-rr.Cmd-fails scenario.
+type partialRejectActor struct{}
+
+func (a *partialRejectActor) EnqueueTry(cmd api.Command) bool { return cmd.Kind == api.CmdBind }
+func (a *partialRejectActor) EnqueueCtx(_ context.Context, cmd api.Command) bool {
+	return cmd.Kind == api.CmdBind
+}
+func (a *partialRejectActor) OnIdle(_ func())        {}
+func (a *partialRejectActor) OnTerminate(_ func())   {}
+func (a *partialRejectActor) Loop(_ context.Context) {}
+
+// TestDispatcher_CreatedActor_RrCmdEnqueueFail_NoLeak verifies that when a
+// newly created actor accepts CmdBind but rejects rr.Cmd:
+//   - Handle returns ErrMailboxFull
+//   - Activate is never called (actor not visible via Get)
+//   - The semaphore is released (cleanup ran)
+func TestDispatcher_CreatedActor_RrCmdEnqueueFail_NoLeak(t *testing.T) {
+	act := &partialRejectActor{}
+	f := &lifecycleFactory{act: act, bound: make(map[string]actor.Actor)}
+	fd := &mockFD{
+		key: "team:worker",
+		cmd: api.Command{Kind: api.CmdRun, Run: &api.RunSpec{RunID: "run-leak", ImageRef: "busybox:1.36"}},
+	}
+	d := dispatcher.NewDispatcher(fd, f, 2)
+
+	err := d.Handle(context.Background(), testInput(), nil)
+	if !errors.Is(err, sErr.ErrMailboxFull) {
+		t.Fatalf("expected ErrMailboxFull when rr.Cmd enqueue fails, got %v", err)
+	}
+
+	// Actor must NOT be visible via Get — Activate was never reached
+	if _, ok := f.Get("team:worker"); ok {
+		t.Fatal("actor must not be in regBound after rr.Cmd enqueue failure")
+	}
+
+	// Semaphore must be fully released
+	if len(d.Sem) != 0 {
+		t.Fatalf("semaphore leak: expected 0 occupied slots, got %d", len(d.Sem))
+	}
+
+	// Unbind must have been called (cleanup path)
+	f.mu.Lock()
+	calls := f.unbindCalls
+	f.mu.Unlock()
+	if calls == 0 {
+		t.Fatal("Unbind must have been called during cleanup")
+	}
+}
+
+// initializingFactory: Bind always returns created=false, needsBind=true,
+// simulating a concurrent goroutine that already placed the actor in regBinding.
+type initializingFactory struct{}
+
+func (f *initializingFactory) Get(_ string) (actor.Actor, bool) { return nil, false }
+func (f *initializingFactory) Bind(_ string) (actor.Actor, bool, bool, error) {
+	return &mockActor{}, false, true, nil
+}
+func (f *initializingFactory) Activate(_ string, _ actor.Actor) bool { return true }
+func (f *initializingFactory) Register(_ string, _ actor.Actor)      {}
+func (f *initializingFactory) Unbind(_ string, _ actor.Actor)        {}
+
+// TestDispatcher_NeedsBindPath_ReturnsSaturated verifies that when Bind
+// returns created=false, needsBind=true (actor owned by another goroutine),
+// Handle returns ErrSaturated and the semaphore is released.
+func TestDispatcher_NeedsBindPath_ReturnsSaturated(t *testing.T) {
+	fd := &mockFD{
+		key: "team:initializing",
+		cmd: api.Command{Kind: api.CmdRun, Run: &api.RunSpec{RunID: "run-sat", ImageRef: "busybox:1.36"}},
+	}
+	d := dispatcher.NewDispatcher(fd, &initializingFactory{}, 2)
+
+	err := d.Handle(context.Background(), testInput(), nil)
+	if !errors.Is(err, sErr.ErrSaturated) {
+		t.Fatalf("expected ErrSaturated for needsBind=true non-owner path, got %v", err)
+	}
+
+	// Semaphore must be released
+	if len(d.Sem) != 0 {
+		t.Fatalf("semaphore leak: expected 0 occupied slots, got %d", len(d.Sem))
 	}
 }

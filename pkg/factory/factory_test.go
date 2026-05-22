@@ -53,7 +53,9 @@ func TestFactory_BindRegisterGetUnbind(t *testing.T) {
 	}
 
 	// After Activate: visible via Get
-	f.Activate("tenant:run-1")
+	if !f.Activate("tenant:run-1", act1) {
+		t.Fatal("Activate must return true for a valid regBinding actor")
+	}
 	got, ok := f.Get("tenant:run-1")
 	if !ok || got != act1 {
 		t.Fatal("actor should be visible via Get after Activate")
@@ -176,7 +178,7 @@ func TestFactory_UnbindWrongActorDoesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	f.Activate("tenant:run-1")
+	f.Activate("tenant:run-1", act1)
 
 	wrong := &testActor{id: 999}
 	f.Unbind("tenant:run-1", wrong)
@@ -223,7 +225,9 @@ func TestFactory_BindingActorNotExposedViaGet(t *testing.T) {
 	}
 
 	// Activate: now visible to Get
-	f.Activate("key-1")
+	if !f.Activate("key-1", act) {
+		t.Fatal("Activate must return true for the registered actor")
+	}
 	got, ok := f.Get("key-1")
 	if !ok || got != act {
 		t.Fatal("after Activate, actor must be visible via Get")
@@ -239,6 +243,53 @@ func TestFactory_BindingActorNotExposedViaGet(t *testing.T) {
 	}
 	if act3 != act {
 		t.Fatal("third Bind must return same actor")
+	}
+}
+
+func TestFactory_Activate_StaleActorReturnsFalse(t *testing.T) {
+	f := factory.NewFactory(
+		func(string) driver.Driver { return &testDriver{} },
+		func(string, driver.Driver, int) actor.Actor { return &testActor{id: 1} },
+		8,
+	)
+
+	act, _, _, err := f.Bind("key-stale")
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	// Simulate cleanup before Activate (e.g., CmdBind enqueue failed)
+	f.Unbind("key-stale", act)
+
+	// Activate on a cleaned-up actor must return false
+	if f.Activate("key-stale", act) {
+		t.Fatal("Activate after Unbind must return false (stale actor)")
+	}
+
+	// Actor must not appear in regBound
+	if _, ok := f.Get("key-stale"); ok {
+		t.Fatal("stale actor must not be visible after failed Activate")
+	}
+
+	// Activate with wrong actor must also return false
+	f2act, _, _, err := f.Bind("key-stale")
+	if err != nil {
+		t.Fatalf("second Bind: %v", err)
+	}
+	wrong := &testActor{id: 999}
+	if f.Activate("key-stale", wrong) {
+		t.Fatal("Activate with wrong actor must return false")
+	}
+	// The real actor must still be in regBinding
+	if _, ok := f.Get("key-stale"); ok {
+		t.Fatal("actor should not be in regBound after failed Activate with wrong actor")
+	}
+	// Activate with correct actor succeeds
+	if !f.Activate("key-stale", f2act) {
+		t.Fatal("Activate with correct actor must return true")
+	}
+	if got, ok := f.Get("key-stale"); !ok || got != f2act {
+		t.Fatal("actor should be visible after successful Activate")
 	}
 }
 
