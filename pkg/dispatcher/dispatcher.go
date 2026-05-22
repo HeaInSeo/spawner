@@ -446,6 +446,12 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 
 	// 2) 바운드 조회
 	act, ok := d.AF.Get(rr.SpawnKey)
+	if ok && rr.Cmd.Kind == api.CmdRun {
+		// Session actor: one Run per lifecycle. Block additional CmdRun while
+		// the actor is active to prevent "not bound" errors from buffered
+		// commands racing with the actor's idle transition.
+		return sErr.ErrSaturated
+	}
 	if !ok {
 		// 3) 바인딩 기간 동안만 세마 점유 (non-blocking)
 		select {
@@ -465,15 +471,21 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 				if base == nil {
 					base = ctx
 				}
+				loopCtx, stopLoop := context.WithCancel(base)
+
 				releaseOnce := syncRelease(d.Sem, d.AF, rr.SpawnKey, act)
 				act.OnIdle(releaseOnce)
 				act.OnTerminate(releaseOnce)
-				go act.Loop(base)
 
+				// cleanup stops the Loop goroutine and releases factory/semaphore.
+				// Uses releaseOnce so it is safe to call alongside the actor's own
+				// OnIdle/OnTerminate path — sync.Once prevents double-release.
 				cleanup := func() {
-					d.AF.Unbind(rr.SpawnKey, act)
-					<-d.Sem
+					stopLoop()
+					releaseOnce()
 				}
+
+				go act.Loop(loopCtx)
 
 				bindCmd, err := api.NewBindCommand(&api.Bind{SpawnKey: rr.SpawnKey})
 				if err != nil {

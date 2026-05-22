@@ -1096,3 +1096,165 @@ func TestDispatcher_NeedsBindPath_ReturnsSaturated(t *testing.T) {
 		t.Fatalf("semaphore leak: expected 0 occupied slots, got %d", len(d.Sem))
 	}
 }
+
+// ctxAwareActor is a test actor whose Loop blocks on ctx.Done().
+// EnqueueCtx accepts commands in acceptKinds; all others return false.
+// When Loop exits it invokes the OnTerminate callback (simulating real actor
+// defer behaviour), so tests can verify double-release safety via sync.Once.
+type ctxAwareActor struct {
+	acceptKinds map[api.CmdKind]bool
+	loopExited  chan struct{}
+	mu          sync.Mutex
+	onTermFn    func()
+}
+
+func newCtxAwareActor(accept ...api.CmdKind) *ctxAwareActor {
+	m := make(map[api.CmdKind]bool)
+	for _, k := range accept {
+		m[k] = true
+	}
+	return &ctxAwareActor{acceptKinds: m, loopExited: make(chan struct{})}
+}
+
+func (a *ctxAwareActor) EnqueueTry(cmd api.Command) bool { return a.acceptKinds[cmd.Kind] }
+func (a *ctxAwareActor) EnqueueCtx(_ context.Context, cmd api.Command) bool {
+	return a.acceptKinds[cmd.Kind]
+}
+func (a *ctxAwareActor) OnIdle(_ func()) {}
+func (a *ctxAwareActor) OnTerminate(fn func()) {
+	a.mu.Lock()
+	a.onTermFn = fn
+	a.mu.Unlock()
+}
+func (a *ctxAwareActor) Loop(ctx context.Context) {
+	defer func() {
+		a.mu.Lock()
+		fn := a.onTermFn
+		a.mu.Unlock()
+		if fn != nil {
+			fn() // mirrors real actor: calls releaseOnce on exit
+		}
+		close(a.loopExited)
+	}()
+	<-ctx.Done()
+}
+
+// waitLoopExit blocks until actor.loopExited is closed or the test deadline.
+func waitLoopExit(t *testing.T, act *ctxAwareActor) {
+	t.Helper()
+	select {
+	case <-act.loopExited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("actor Loop goroutine did not exit within 2s after cleanup")
+	}
+}
+
+// TestDispatcher_CreatedActor_CmdBindFail_LoopTerminates verifies that when
+// CmdBind enqueue fails, cleanup() stops the Loop goroutine and releases the
+// semaphore. Also exercises double-release safety: both cleanup's releaseOnce
+// and the actor's own OnTerminate path call releaseOnce — sync.Once ensures
+// exactly one release.
+func TestDispatcher_CreatedActor_CmdBindFail_LoopTerminates(t *testing.T) {
+	// Actor rejects ALL commands (CmdBind enqueue will fail immediately)
+	act := newCtxAwareActor() // empty accept set
+	f := &lifecycleFactory{act: act, bound: make(map[string]actor.Actor)}
+	fd := &mockFD{
+		key: "team:worker-bind-fail",
+		cmd: api.Command{Kind: api.CmdRun, Run: &api.RunSpec{RunID: "run-bf", ImageRef: "busybox:1.36"}},
+	}
+	d := dispatcher.NewDispatcher(fd, f, 2)
+
+	err := d.Handle(context.Background(), testInput(), nil)
+	if !errors.Is(err, sErr.ErrMailboxFull) {
+		t.Fatalf("expected ErrMailboxFull when CmdBind enqueue fails, got %v", err)
+	}
+
+	// Loop goroutine must exit (stopLoop was called by cleanup)
+	waitLoopExit(t, act)
+
+	// Semaphore must be released (sync.Once prevents double-release)
+	if len(d.Sem) != 0 {
+		t.Fatalf("semaphore leak after CmdBind failure: len=%d", len(d.Sem))
+	}
+
+	// Actor must not be in regBound
+	if _, ok := f.Get("team:worker-bind-fail"); ok {
+		t.Fatal("actor must not be in regBound after CmdBind failure")
+	}
+}
+
+// TestDispatcher_CreatedActor_RrCmdFail_LoopTerminates verifies that when
+// CmdBind succeeds but rr.Cmd enqueue fails, cleanup() stops the Loop goroutine
+// and releases the semaphore. Double-release safety is exercised as above.
+func TestDispatcher_CreatedActor_RrCmdFail_LoopTerminates(t *testing.T) {
+	// Actor accepts CmdBind but rejects CmdRun
+	act := newCtxAwareActor(api.CmdBind)
+	f := &lifecycleFactory{act: act, bound: make(map[string]actor.Actor)}
+	fd := &mockFD{
+		key: "team:worker-run-fail",
+		cmd: api.Command{Kind: api.CmdRun, Run: &api.RunSpec{RunID: "run-rf", ImageRef: "busybox:1.36"}},
+	}
+	d := dispatcher.NewDispatcher(fd, f, 2)
+
+	err := d.Handle(context.Background(), testInput(), nil)
+	if !errors.Is(err, sErr.ErrMailboxFull) {
+		t.Fatalf("expected ErrMailboxFull when rr.Cmd enqueue fails, got %v", err)
+	}
+
+	// Loop goroutine must exit
+	waitLoopExit(t, act)
+
+	// Semaphore must be released
+	if len(d.Sem) != 0 {
+		t.Fatalf("semaphore leak after rr.Cmd failure: len=%d", len(d.Sem))
+	}
+
+	// Actor must not be in regBound (Activate never called)
+	if _, ok := f.Get("team:worker-run-fail"); ok {
+		t.Fatal("actor must not be in regBound after rr.Cmd enqueue failure")
+	}
+}
+
+// TestDispatcher_ActiveActor_AdditionalCmdRunReturnsSaturated verifies session
+// actor semantics: a second CmdRun for the same spawnKey while an actor is
+// already in regBound returns ErrSaturated, preventing buffered-command races
+// with the actor's idle transition ("not bound" error).
+func TestDispatcher_ActiveActor_AdditionalCmdRunReturnsSaturated(t *testing.T) {
+	loopCtx, cancelLoop := context.WithCancel(context.Background())
+	defer cancelLoop()
+
+	// Actor accepts both CmdBind and CmdRun so the first Handle succeeds
+	act := newCtxAwareActor(api.CmdBind, api.CmdRun)
+	f := &lifecycleFactory{act: act, bound: make(map[string]actor.Actor)}
+	fd := &mockFD{
+		key: "team:session",
+		cmd: api.Command{Kind: api.CmdRun, Run: &api.RunSpec{RunID: "run-001", ImageRef: "busybox:1.36"}},
+	}
+	d := dispatcher.NewDispatcher(fd, f, 2, dispatcher.WithLoopBaseCtx(loopCtx))
+
+	// First Handle: creates actor, succeeds
+	if err := d.Handle(context.Background(), testInput(), nil); err != nil {
+		t.Fatalf("first Handle: %v", err)
+	}
+
+	// Actor should now be in regBound
+	if _, ok := f.Get("team:session"); !ok {
+		t.Fatal("actor should be in regBound after successful first Handle")
+	}
+
+	// Second Handle with CmdRun on same spawnKey: session semantics → ErrSaturated
+	err := d.Handle(context.Background(), testInput(), nil)
+	if !errors.Is(err, sErr.ErrSaturated) {
+		t.Fatalf("expected ErrSaturated for second CmdRun on active session actor, got %v", err)
+	}
+
+	// Actor must still be in regBound (not disturbed by ErrSaturated)
+	if _, ok := f.Get("team:session"); !ok {
+		t.Fatal("actor should remain in regBound after ErrSaturated")
+	}
+
+	// Semaphore must not be leaked (ErrSaturated path never takes the semaphore)
+	if len(d.Sem) != 1 {
+		t.Fatalf("expected 1 semaphore slot occupied (by active actor), got %d", len(d.Sem))
+	}
+}
