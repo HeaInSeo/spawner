@@ -2,6 +2,30 @@
 
 Job spawner for Kubernetes — dispatches workloads via a driver interface, with the k8s implementation isolated in `cmd/imp/`.
 
+This repository provides:
+
+- A small `driver.Driver` abstraction for execution backends
+- `DriverK8s` for Kubernetes Job execution
+- `BoundedDriver` for burst control on `Start()`
+- `K8sObserver` for Kueue admission and kube-scheduler observation
+- Dispatcher / Actor / FrontDoor for ingress and worker orchestration
+- Durable-lite `RunStore` implementations for restart-oriented experiments
+
+## Current Status
+
+The repository is usable as a PoC execution backend and is already being exercised from the sibling `poc` project.
+
+From the `poc` integration point of view, the most valuable parts of this repository are:
+
+- `cmd/imp/k8s_driver.go`
+- `cmd/imp/bounded_driver.go`
+- `cmd/imp/k8s_observer.go`
+- `pkg/driver`
+- `pkg/dispatcher`
+- `pkg/store`
+
+The codebase is strong enough for architecture validation, but it is not yet a fully productized execution service.
+
 ## Package structure
 
 ```
@@ -41,6 +65,26 @@ make vuln-all        # govulncheck (all packages) → reports/govulncheck-all.tx
 | `lint.yml` | push / PR | `make lint` (includes depguard boundary check) |
 | `test.yml` | push / PR | `make test` + `make coverage-check`, uploads `reports/` artifact |
 | `security-observe.yml` | manual | gosec + govulncheck, uploads `reports/` artifact |
+
+## Productization Review
+
+Based on the `poc` integration review, the main reinforcement areas are:
+
+- Replace `Wait()` polling with watch/informer-based observation
+- Separate logical run identity from physical job/attempt identity
+- Strengthen duplicate submit, retry, and recovery semantics
+- Expand `RunSpec` for production needs
+- Turn bootstrap/recovery into real executable behavior
+- Upgrade observability from helper methods to operator-facing state/event models
+
+Detailed bilingual review documents:
+
+- Korean: [docs/SPAWNER_REINFORCEMENT_REVIEW.ko.md](docs/SPAWNER_REINFORCEMENT_REVIEW.ko.md)
+- English: [docs/SPAWNER_REINFORCEMENT_REVIEW.en.md](docs/SPAWNER_REINFORCEMENT_REVIEW.en.md)
+- Korean sprint plan: [docs/SPAWNER_SPRINT_PLAN.ko.md](docs/SPAWNER_SPRINT_PLAN.ko.md)
+- English sprint plan: [docs/SPAWNER_SPRINT_PLAN.en.md](docs/SPAWNER_SPRINT_PLAN.en.md)
+- Korean recovery contract: [docs/SPAWNER_RECOVERY_CONTRACT.ko.md](docs/SPAWNER_RECOVERY_CONTRACT.ko.md)
+- English recovery contract: [docs/SPAWNER_RECOVERY_CONTRACT.en.md](docs/SPAWNER_RECOVERY_CONTRACT.en.md)
 
 ## depguard — k8s 경계 강제
 
@@ -94,3 +138,10 @@ Current `RunSpec.Placement` semantics are intentionally narrow.
 - `PreferredNodes`: mapped to `nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution`
 
 `RequiredNodeName`과 `PreferredNodes`는 동시에 사용하지 않는다 (v0 제약).
+
+Important notes:
+
+- `RequiredNodeName` is a hard placement constraint.
+- `PreferredNodes` are soft hints only. The Kubernetes scheduler is not required to honor them.
+- `RequiredNodeName` and `PreferredNodes` must not be used together in the current v0 surface.
+- `MaterializationPlan`, init-container wiring, shared-volume acquisition, and generic PodSpec extension are intentionally deferred.
