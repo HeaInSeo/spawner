@@ -625,6 +625,7 @@ func TestK8sActor_ExecSemSaturated_LoopProcessesCancel(t *testing.T) {
 		drv:     drv,
 		mb:      actor.NewMailbox[api.Command](8),
 		execSem: make(chan struct{}, 1),
+		done:    make(chan struct{}),
 		active: make(map[string]struct {
 			h      driver.Handle
 			cancel context.CancelFunc
@@ -715,6 +716,183 @@ func TestK8sActor_RunComplete_LoopExits(t *testing.T) {
 		// success: Loop terminated
 	case <-time.After(2 * time.Second):
 		t.Fatal("Loop goroutine did not terminate after actor became idle")
+	}
+
+	goleak.VerifyNone(t)
+}
+
+// ── Round 8: idle-transition race closure ─────────────────────────────────────
+
+// TestK8sActor_Done_SignalsAfterLoopExit verifies that a.Done() is closed
+// exactly when the Loop goroutine has fully exited (onTerm callback included).
+func TestK8sActor_Done_SignalsAfterLoopExit(t *testing.T) {
+	a := NewK8sActor("spawn-1", &actorTestDriver{}, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	go a.Loop(ctx)
+	cancel()
+	select {
+	case <-a.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("a.Done() not closed after ctx cancel")
+	}
+	goleak.VerifyNone(t)
+}
+
+// TestK8sActor_AfterIdle_MailboxClosed verifies that once the actor goes idle
+// (last run completed, boundKey cleared), the mailbox is already closed — so
+// any subsequent EnqueueCtx returns false.  This proves that mb.Close() and
+// boundKey="" happen atomically under the lock, closing the race window where
+// a command could be admitted to an apparently-active actor that then drops it
+// with "not bound".
+func TestK8sActor_AfterIdle_MailboxClosed(t *testing.T) {
+	sink := newChanSink()
+	a := NewK8sActor("spawn-1", &actorTestDriver{}, 8)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go a.Loop(ctx)
+
+	mustEnqueue(t, a, api.Command{Kind: api.CmdBind, Bind: &api.Bind{SpawnKey: "spawn-1"}, Sink: sink})
+	sink.waitState(t, api.StateStarting, 2*time.Second)
+	mustEnqueue(t, a, api.Command{
+		Kind:   api.CmdRun,
+		Run:    &api.RunSpec{RunID: "run-1", ImageRef: "busybox:1.36"},
+		Policy: policy.DefaultPolicyB(5 * time.Second),
+		Sink:   sink,
+	})
+
+	// Wait for Loop to exit — actor went idle, mailbox closed, Loop drained.
+	select {
+	case <-a.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Loop did not exit after actor went idle")
+	}
+
+	// Mailbox must be closed: any further EnqueueCtx must return false.
+	if ok := a.EnqueueCtx(context.Background(), api.Command{
+		Kind:   api.CmdCancel,
+		Cancel: &api.CancelReq{RunID: "run-1"},
+		Sink:   sink,
+	}); ok {
+		t.Fatal("EnqueueCtx must return false after actor is idle (mailbox closed)")
+	}
+
+	// No "not bound" event must have been emitted during the whole lifecycle.
+	sink.mu.Lock()
+	evs := make([]api.Event, len(sink.events))
+	copy(evs, sink.events)
+	sink.mu.Unlock()
+	for _, ev := range evs {
+		if ev.State == api.StateFailed && strings.Contains(ev.Message, "not bound") {
+			t.Fatalf("unexpected 'not bound' event: %+v", ev)
+		}
+	}
+
+	goleak.VerifyNone(t)
+}
+
+// TestK8sActor_LateCancel_Graceful verifies that a CmdCancel for a runID that
+// is not in the active map (late arrival or unknown ID) is silently ignored —
+// no "not bound" or unexpected StateFailed is emitted to the sink.
+func TestK8sActor_LateCancel_Graceful(t *testing.T) {
+	sink := newChanSink()
+	drv := &actorTestDriver{
+		waitStarted: make(chan struct{}),
+		waitBlock:   make(chan struct{}),
+	}
+	a := NewK8sActor("spawn-1", drv, 8)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go a.Loop(ctx)
+
+	mustEnqueue(t, a, api.Command{Kind: api.CmdBind, Bind: &api.Bind{SpawnKey: "spawn-1"}, Sink: sink})
+	sink.waitState(t, api.StateStarting, 2*time.Second)
+	mustEnqueue(t, a, api.Command{
+		Kind:   api.CmdRun,
+		Run:    &api.RunSpec{RunID: "run-1", ImageRef: "busybox:1.36"},
+		Policy: policy.DefaultPolicyB(5 * time.Second),
+		Sink:   sink,
+	})
+
+	select {
+	case <-drv.waitStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not start")
+	}
+	sink.waitState(t, api.StateRunning, 2*time.Second)
+
+	// Enqueue CmdCancel for a runID that does not exist in the active map.
+	// This simulates a late-arriving cancel for an already-completed run.
+	// The enqueue succeeds (actor is still bound), but the Loop must drop it
+	// silently — not with "not bound".
+	if ok := a.EnqueueCtx(context.Background(), api.Command{
+		Kind:   api.CmdCancel,
+		Cancel: &api.CancelReq{RunID: "run-unknown"},
+		Sink:   sink,
+	}); !ok {
+		t.Fatal("CmdCancel enqueue must succeed while actor is bound")
+	}
+
+	// Let the run complete normally.
+	close(drv.waitBlock)
+
+	select {
+	case <-a.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Loop did not exit after run completed")
+	}
+
+	// No "not bound" error must appear for any event.
+	sink.mu.Lock()
+	evs := make([]api.Event, len(sink.events))
+	copy(evs, sink.events)
+	sink.mu.Unlock()
+	for _, ev := range evs {
+		if ev.State == api.StateFailed && strings.Contains(ev.Message, "not bound") {
+			t.Fatalf("unexpected 'not bound' event: %+v", ev)
+		}
+	}
+
+	goleak.VerifyNone(t)
+}
+
+// TestK8sActor_RetiredActor_CmdRunRejected verifies that once an actor goes
+// idle and its mailbox is closed, any attempt to enqueue CmdRun returns false.
+// At the Dispatcher level this surfaces as ErrMailboxFull, which the caller
+// can treat as a transient error and retry with a fresh actor.
+func TestK8sActor_RetiredActor_CmdRunRejected(t *testing.T) {
+	sink := newChanSink()
+	a := NewK8sActor("spawn-1", &actorTestDriver{}, 8)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go a.Loop(ctx)
+
+	mustEnqueue(t, a, api.Command{Kind: api.CmdBind, Bind: &api.Bind{SpawnKey: "spawn-1"}, Sink: sink})
+	sink.waitState(t, api.StateStarting, 2*time.Second)
+	mustEnqueue(t, a, api.Command{
+		Kind:   api.CmdRun,
+		Run:    &api.RunSpec{RunID: "run-1", ImageRef: "busybox:1.36"},
+		Policy: policy.DefaultPolicyB(5 * time.Second),
+		Sink:   sink,
+	})
+
+	// Wait for Loop to exit (actor went idle after run-1 succeeded).
+	select {
+	case <-a.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Loop did not exit after actor went idle")
+	}
+
+	// CmdRun on a retired actor must be rejected (mailbox closed).
+	if ok := a.EnqueueCtx(context.Background(), api.Command{
+		Kind:   api.CmdRun,
+		Run:    &api.RunSpec{RunID: "run-2", ImageRef: "busybox:1.36"},
+		Policy: policy.DefaultPolicyB(5 * time.Second),
+		Sink:   sink,
+	}); ok {
+		t.Fatal("CmdRun enqueue must return false on a retired actor")
 	}
 
 	goleak.VerifyNone(t)

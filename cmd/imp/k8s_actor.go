@@ -36,7 +36,8 @@ type K8sActor struct {
 	execWG sync.WaitGroup
 
 	// 추가
-	boundKey string // ""면 Idle
+	boundKey string        // ""면 Idle
+	done     chan struct{} // closed when Loop returns (after all cleanup)
 }
 
 func NewK8sActor(key string, drv driver.Driver, mbSize int) *K8sActor {
@@ -45,12 +46,19 @@ func NewK8sActor(key string, drv driver.Driver, mbSize int) *K8sActor {
 		drv:     drv,
 		mb:      actor.NewMailbox[api.Command](mbSize),
 		execSem: make(chan struct{}, 2), // 기본 병렬도(필요 시 옵션화)
+		done:    make(chan struct{}),
 		active: make(map[string]struct {
 			h      driver.Handle
 			cancel context.CancelFunc
 		}),
 	}
 }
+
+// Done returns a channel that is closed when the Loop goroutine has fully
+// exited (all run goroutines drained, onTerm called).  Callers that need
+// to wait for clean shutdown — notably tests — can block on this channel
+// instead of using time.Sleep.
+func (a *K8sActor) Done() <-chan struct{} { return a.done }
 
 func (a *K8sActor) OnIdle(fn func()) {
 	a.mu.Lock()
@@ -89,6 +97,9 @@ func (a *K8sActor) Loop(ctx context.Context) {
 		a.mu.Unlock()
 		if onTerm != nil {
 			onTerm()
+		}
+		if a.done != nil {
+			close(a.done) // signal: Loop has fully exited
 		}
 	}()
 
@@ -199,6 +210,12 @@ func (a *K8sActor) Loop(ctx context.Context) {
 						a.mu.Lock()
 						delete(a.active, runID)
 						if len(a.active) == 0 && a.boundKey != "" {
+							// Close mailbox under the lock so that no new
+							// enqueues can succeed after boundKey is cleared.
+							// Callers that attempt EnqueueCtx after this point
+							// get false (mailbox closed) rather than delivering
+							// a command that the Loop would drop with "not bound".
+							a.mb.Close()
 							a.boundKey = ""
 							becameIdle = true
 							idleFn = a.onIdle
@@ -207,7 +224,6 @@ func (a *K8sActor) Loop(ctx context.Context) {
 						a.execWG.Done()
 
 						if becameIdle {
-							a.mb.Close() // first: prevent new enqueues
 							emitState(c.Sink, a.key, "", api.StateIdle, "unbound")
 							if idleFn != nil {
 								idleFn()
@@ -264,20 +280,14 @@ func (a *K8sActor) Loop(ctx context.Context) {
 					emitErr(cmd.Sink, a.key, "", errors.New("missing cancel payload"))
 					break
 				}
-				// 바인딩 여부 가드
-				a.mu.Lock()
-				if a.boundKey == "" {
-					a.mu.Unlock()
-					emitErr(cmd.Sink, a.key, strings.TrimSpace(cmd.Cancel.RunID), errors.New("not bound"))
-					break
-				}
-				a.mu.Unlock()
-
+				// No boundKey guard: a late-arriving cancel (race with idle
+				// transition) should be silently ignored if the run is gone,
+				// not rejected with "not bound".  Check the active map directly.
 				target := strings.TrimSpace(cmd.Cancel.RunID)
 
 				a.mu.Lock()
 				if target == "" {
-					// (옵션) 빈 타겟이면 모두 취소
+					// empty target → cancel all active runs
 					for id, st := range a.active {
 						if st.h != nil {
 							_ = a.drv.Cancel(context.WithoutCancel(ctx), st.h)
@@ -294,7 +304,7 @@ func (a *K8sActor) Loop(ctx context.Context) {
 				a.mu.Unlock()
 
 				if !ok {
-					emitErr(cmd.Sink, a.key, target, errors.New("no such run in progress"))
+					// Benign late-arrival: run completed before cancel arrived.
 					break
 				}
 				if st.h != nil {
@@ -306,17 +316,12 @@ func (a *K8sActor) Loop(ctx context.Context) {
 				emitState(cmd.Sink, a.key, target, api.StateCancelling, "")
 
 			case api.CmdSignal:
-				// 바인딩 여부/타겟 가드
 				if cmd.Signal == nil || strings.TrimSpace(cmd.Signal.RunID) == "" {
 					emitErr(cmd.Sink, a.key, "", errors.New("empty signal or missing runID"))
 					break
 				}
+				// No boundKey guard for the same reason as CmdCancel.
 				a.mu.Lock()
-				if a.boundKey == "" {
-					a.mu.Unlock()
-					emitErr(cmd.Sink, a.key, cmd.Signal.RunID, errors.New("not bound"))
-					break
-				}
 				st, ok := a.active[strings.TrimSpace(cmd.Signal.RunID)]
 				a.mu.Unlock()
 
