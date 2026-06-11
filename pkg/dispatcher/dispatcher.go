@@ -444,6 +444,11 @@ func (d *Dispatcher) Handle(ctx context.Context, in frontdoor.ResolveInput, sink
 	}
 	// ──────────────────────────────────────────────────────────────────────────
 
+	// Wrap sink to project terminal actor events into RunStore durable state.
+	if rr.Cmd.Kind == api.CmdRun && d.runStore != nil && logicalRunID != "" {
+		s = &runStoreSink{inner: s, runID: logicalRunID, runStore: d.runStore}
+	}
+
 	// 2) 바운드 조회
 	act, ok := d.AF.Get(rr.SpawnKey)
 	if ok && rr.Cmd.Kind == api.CmdRun {
@@ -590,6 +595,54 @@ admitted:
 	// ──────────────────────────────────────────────────────────────────────────
 
 	return nil
+}
+
+// runStoreSink wraps an EventSink and projects terminal actor events into
+// durable RunStore state so recovery after restart sees the correct terminal.
+type runStoreSink struct {
+	inner    api.EventSink
+	runID    string
+	runStore store.RunStore
+}
+
+func (r *runStoreSink) Send(ev api.Event) {
+	r.inner.Send(ev)
+	r.observe(ev)
+}
+
+func (r *runStoreSink) TrySend(ev api.Event, d time.Duration) bool {
+	var ok bool
+	if ts, is := r.inner.(api.TryEventSink); is {
+		ok = ts.TrySend(ev, d)
+	} else {
+		r.inner.Send(ev)
+		ok = true
+	}
+	r.observe(ev)
+	return ok
+}
+
+func (r *runStoreSink) observe(ev api.Event) {
+	if ev.RunID != r.runID {
+		return
+	}
+	ctx := context.Background()
+	switch ev.State {
+	case api.StateRunning:
+		_ = r.runStore.UpdateState(ctx, r.runID, store.StateAdmittedToDag, store.StateRunning)
+	case api.StateSucceeded:
+		if err := r.runStore.UpdateState(ctx, r.runID, store.StateRunning, store.StateFinished); err != nil {
+			_ = r.runStore.UpdateState(ctx, r.runID, store.StateAdmittedToDag, store.StateFinished)
+		}
+	case api.StateFailed:
+		if err := r.runStore.UpdateState(ctx, r.runID, store.StateRunning, store.StateFailed); err != nil {
+			_ = r.runStore.UpdateState(ctx, r.runID, store.StateAdmittedToDag, store.StateFailed)
+		}
+	case api.StateCancelled:
+		if err := r.runStore.UpdateState(ctx, r.runID, store.StateRunning, store.StateCanceled); err != nil {
+			_ = r.runStore.UpdateState(ctx, r.runID, store.StateAdmittedToDag, store.StateCanceled)
+		}
+	}
 }
 
 func syncRelease(sem chan struct{}, af fac.Factory, spawnKey string, act actor.Actor) func() {

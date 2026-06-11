@@ -70,7 +70,10 @@ func (d *DriverK8s) Prepare(ctx context.Context, spec api.RunSpec) (driver.Prepa
 	if spec.ImageRef == "" {
 		return nil, fmt.Errorf("ImageRef is required")
 	}
-	job := buildJob(spec, d.ns)
+	job, err := buildJob(spec, d.ns)
+	if err != nil {
+		return nil, err
+	}
 	return preparedJob{job: job}, nil
 }
 
@@ -150,7 +153,7 @@ func (d *DriverK8s) Cancel(ctx context.Context, h driver.Handle) error {
 //   - suspend: true only when kueue.x-k8s.io/queue-name is present
 //   - plain Kubernetes Jobs start unsuspended by default
 //   - PVC volumes — each Mount.Source is treated as a PVC claim name
-func buildJob(spec api.RunSpec, ns string) *batchv1.Job {
+func buildJob(spec api.RunSpec, ns string) (*batchv1.Job, error) {
 	jobName := sanitizeName(spec.RunID)
 
 	labels := make(map[string]string, len(spec.Labels)+1)
@@ -167,13 +170,17 @@ func buildJob(spec api.RunSpec, ns string) *batchv1.Job {
 		annotations["spawner.correlation-id"] = spec.CorrelationID
 	}
 
+	res, err := buildResources(spec.Resources)
+	if err != nil {
+		return nil, err
+	}
 	container := corev1.Container{
 		Name:            "main",
 		Image:           spec.ImageRef,
 		Command:         spec.Command,
 		WorkingDir:      spec.WorkingDir,
 		Env:             buildEnvVars(spec.Env, spec.EnvFieldRefs),
-		Resources:       buildResources(spec.Resources),
+		Resources:       res,
 		ImagePullPolicy: corev1.PullIfNotPresent,
 	}
 
@@ -214,7 +221,7 @@ func buildJob(spec api.RunSpec, ns string) *batchv1.Job {
 				},
 			},
 		},
-	}
+	}, nil
 }
 
 func buildEnvVars(env map[string]string, fieldRefs map[string]string) []corev1.EnvVar {
@@ -278,20 +285,26 @@ func buildPlacementAffinity(p *api.Placement) *corev1.Affinity {
 	}
 }
 
-func buildResources(r api.Resources) corev1.ResourceRequirements {
+func buildResources(r api.Resources) (corev1.ResourceRequirements, error) {
 	req := corev1.ResourceList{}
 	lim := corev1.ResourceList{}
 	if r.CPU != "" {
-		q := resource.MustParse(r.CPU)
+		q, err := resource.ParseQuantity(r.CPU)
+		if err != nil {
+			return corev1.ResourceRequirements{}, fmt.Errorf("invalid CPU resource %q: %w", r.CPU, err)
+		}
 		req[corev1.ResourceCPU] = q
 		lim[corev1.ResourceCPU] = q
 	}
 	if r.Memory != "" {
-		q := resource.MustParse(r.Memory)
+		q, err := resource.ParseQuantity(r.Memory)
+		if err != nil {
+			return corev1.ResourceRequirements{}, fmt.Errorf("invalid memory resource %q: %w", r.Memory, err)
+		}
 		req[corev1.ResourceMemory] = q
 		lim[corev1.ResourceMemory] = q
 	}
-	return corev1.ResourceRequirements{Requests: req, Limits: lim}
+	return corev1.ResourceRequirements{Requests: req, Limits: lim}, nil
 }
 
 // buildVolumes converts RunSpec.Mounts to K8s Volumes + VolumeMounts.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/HeaInSeo/spawner/pkg/actor"
 	"github.com/HeaInSeo/spawner/pkg/api"
@@ -80,16 +81,29 @@ func (a *K8sActor) Loop(ctx context.Context) {
 		a.mb.Close()
 
 		// 모든 active 실행 취소 및 종료 대기
+		// Copy handles under lock, then cancel outside lock to avoid holding
+		// mutex during I/O (K8s API calls).
+		type handleEntry struct {
+			h      driver.Handle
+			cancel context.CancelFunc
+		}
 		a.mu.Lock()
+		entries := make([]handleEntry, 0, len(a.active))
 		for _, st := range a.active {
-			if st.h != nil {
-				_ = a.drv.Cancel(context.WithoutCancel(ctx), st.h)
-			}
-			if st.cancel != nil {
-				st.cancel()
-			}
+			entries = append(entries, handleEntry{h: st.h, cancel: st.cancel})
 		}
 		a.mu.Unlock()
+
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		for _, e := range entries {
+			if e.h != nil {
+				_ = a.drv.Cancel(cleanupCtx, e.h)
+			}
+			if e.cancel != nil {
+				e.cancel()
+			}
+		}
 		a.execWG.Wait()
 
 		a.mu.Lock()
@@ -285,19 +299,31 @@ func (a *K8sActor) Loop(ctx context.Context) {
 				// not rejected with "not bound".  Check the active map directly.
 				target := strings.TrimSpace(cmd.Cancel.RunID)
 
+				cancelCtx, cancelDone := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancelDone()
+
 				a.mu.Lock()
 				if target == "" {
-					// empty target → cancel all active runs
+					// empty target → cancel all active runs; copy under lock, cancel outside
+					type idEntry struct {
+						id string
+						h  driver.Handle
+						fn context.CancelFunc
+					}
+					entries := make([]idEntry, 0, len(a.active))
 					for id, st := range a.active {
-						if st.h != nil {
-							_ = a.drv.Cancel(context.WithoutCancel(ctx), st.h)
-						}
-						if st.cancel != nil {
-							st.cancel()
-						}
-						emitState(cmd.Sink, a.key, id, api.StateCancelling, "")
+						entries = append(entries, idEntry{id: id, h: st.h, fn: st.cancel})
 					}
 					a.mu.Unlock()
+					for _, e := range entries {
+						if e.h != nil {
+							_ = a.drv.Cancel(cancelCtx, e.h)
+						}
+						if e.fn != nil {
+							e.fn()
+						}
+						emitState(cmd.Sink, a.key, e.id, api.StateCancelling, "")
+					}
 					break
 				}
 				st, ok := a.active[target]
@@ -308,7 +334,7 @@ func (a *K8sActor) Loop(ctx context.Context) {
 					break
 				}
 				if st.h != nil {
-					_ = a.drv.Cancel(context.WithoutCancel(ctx), st.h)
+					_ = a.drv.Cancel(cancelCtx, st.h)
 				}
 				if st.cancel != nil {
 					st.cancel()
@@ -329,7 +355,9 @@ func (a *K8sActor) Loop(ctx context.Context) {
 					emitErr(cmd.Sink, a.key, cmd.Signal.RunID, errors.New("no active handle for signal"))
 					break
 				}
-				_ = a.drv.Signal(context.WithoutCancel(ctx), st.h, *cmd.Signal)
+				sigCtx, sigDone := context.WithTimeout(context.Background(), 10*time.Second)
+				_ = a.drv.Signal(sigCtx, st.h, *cmd.Signal)
+				sigDone()
 			}
 		}
 	}

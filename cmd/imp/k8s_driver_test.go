@@ -59,7 +59,10 @@ func TestBuildJob_MapsSpecFields(t *testing.T) {
 		Placement:          &api.Placement{NodeSelector: map[string]string{"kubernetes.io/hostname": "lab-worker-1"}},
 	}
 
-	job := buildJob(spec, "default")
+	job, err := buildJob(spec, "default")
+	if err != nil {
+		t.Fatalf("buildJob: %v", err)
+	}
 
 	if job.Name != "my-run-01" {
 		t.Fatalf("unexpected sanitized job name: %q", job.Name)
@@ -144,7 +147,10 @@ func TestBuildJob_MapsRequiredPlacementToHostnameSelector(t *testing.T) {
 		Placement:   &api.Placement{RequiredNodeName: "lab-worker-2"},
 	}
 
-	job := buildJob(spec, "default")
+	job, err := buildJob(spec, "default")
+	if err != nil {
+		t.Fatalf("buildJob: %v", err)
+	}
 
 	if got := job.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"]; got != "lab-worker-2" {
 		t.Fatalf("required placement selector = %q, want lab-worker-2", got)
@@ -168,7 +174,10 @@ func TestBuildJob_MapsPreferredPlacementToNodeAffinity(t *testing.T) {
 		},
 	}
 
-	job := buildJob(spec, "default")
+	job, err := buildJob(spec, "default")
+	if err != nil {
+		t.Fatalf("buildJob: %v", err)
+	}
 
 	if len(job.Spec.Template.Spec.NodeSelector) != 0 {
 		t.Fatalf("expected no nodeSelector for preferred-only placement, got %+v", job.Spec.Template.Spec.NodeSelector)

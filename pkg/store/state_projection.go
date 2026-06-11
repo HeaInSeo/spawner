@@ -41,6 +41,9 @@ func ProjectState(s RunState) StateProjection {
 	case StateFinished:
 		p.PrimaryEvent = api.StateSucceeded
 		p.HasPrimaryEvent = true
+	case StateFailed:
+		p.PrimaryEvent = api.StateFailed
+		p.HasPrimaryEvent = true
 	case StateCanceled:
 		p.PrimaryEvent = api.StateCancelled
 		p.HasPrimaryEvent = true

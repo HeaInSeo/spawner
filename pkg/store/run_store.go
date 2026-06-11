@@ -32,6 +32,8 @@ const (
 	StateRunning RunState = "running"
 	// StateFinished: all nodes completed (terminal).
 	StateFinished RunState = "finished"
+	// StateFailed: execution failed (terminal).
+	StateFailed RunState = "failed"
 	// StateCanceled: run was canceled (terminal).
 	StateCanceled RunState = "canceled"
 )
@@ -42,9 +44,10 @@ var validTransitions = map[RunState][]RunState{
 	StateQueued:        {StateHeld, StateAdmittedToDag, StateCanceled},
 	StateHeld:          {StateResumed, StateCanceled},
 	StateResumed:       {StateAdmittedToDag, StateCanceled},
-	StateAdmittedToDag: {StateRunning, StateCanceled},
-	StateRunning:       {StateFinished, StateCanceled},
+	StateAdmittedToDag: {StateRunning, StateFailed, StateCanceled},
+	StateRunning:       {StateFinished, StateFailed, StateCanceled},
 	StateFinished:      {}, // terminal
+	StateFailed:        {}, // terminal
 	StateCanceled:      {}, // terminal
 }
 
@@ -111,7 +114,7 @@ func ValidateTransition(from, to RunState) error {
 
 // IsTerminal reports whether s is a terminal state (no further transitions).
 func IsTerminal(s RunState) bool {
-	return s == StateFinished || s == StateCanceled
+	return s == StateFinished || s == StateFailed || s == StateCanceled
 }
 
 // IsRecoverable reports whether a persisted run state should be considered a
