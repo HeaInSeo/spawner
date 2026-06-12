@@ -92,7 +92,10 @@ func (r *runtimeImpl) CancelAttempt(ctx context.Context, h AttemptHandle) error 
 // firstEvent is emitted immediately: Submitted on the normal path, or the
 // Snapshot state on the recovery path. The loop then forwards JobEvents from
 // JobClient.Watch and handles temporary errors with backoff reconnect.
-func (r *runtimeImpl) watchLoop(ctx context.Context, entry *attemptEntry, h AttemptHandle, outCh chan<- AttemptEvent, firstEvent AttemptEvent) {
+func (r *runtimeImpl) watchLoop(
+	ctx context.Context, entry *attemptEntry, h AttemptHandle,
+	outCh chan<- AttemptEvent, firstEvent AttemptEvent,
+) {
 	defer func() {
 		close(outCh)
 		entry.mu.Lock()
@@ -154,56 +157,21 @@ func (r *runtimeImpl) watchLoop(ctx context.Context, entry *attemptEntry, h Atte
 // errs is tracked locally and set to nil on close. A nil channel blocks forever
 // in select, which prevents a closed Errs from repeatedly winning the select race
 // against a still-live Events channel.
-func (r *runtimeImpl) consumeWatch(ctx context.Context, entry *attemptEntry, h AttemptHandle, outCh chan<- AttemptEvent, jw JobWatch) (done bool, reconnect bool) {
+func (r *runtimeImpl) consumeWatch(
+	ctx context.Context, entry *attemptEntry, h AttemptHandle,
+	outCh chan<- AttemptEvent, jw JobWatch,
+) (done bool, reconnect bool) {
 	errs := jw.Errs // set to nil on close to remove from select
 
 	for {
 		select {
 		case ev, ok := <-jw.Events:
 			if !ok {
-				// Events closed. Per JobWatch contract, errors are sent to Errs
-				// before Events is closed, so check for a buffered error first.
-				if errs != nil {
-					select {
-					case watchErr, hasErr := <-errs:
-						if hasErr {
-							return r.handleWatchErr(ctx, entry, h, outCh, watchErr)
-						}
-					default:
-					}
-				}
-				return true, false
+				return r.onEventsClosed(ctx, entry, h, outCh, errs)
 			}
-
-			// Drop backward state transitions.
-			entry.mu.Lock()
-			cur := entry.state
-			entry.mu.Unlock()
-			if stateOrder(ev.State) < stateOrder(cur) {
-				continue
-			}
-
-			ae := AttemptEvent{
-				AttemptID: h.AttemptID,
-				State:     ev.State,
-				Reason:    ev.Reason,
-				Message:   ev.Message,
-				Timestamp: ev.Timestamp,
-			}
-
-			if ev.State.IsTerminal() {
-				if entry.transitionToTerminal(ev.State, ev.Reason, ev.Message, ev.Timestamp) {
-					r.decrementActive()
-				}
-				_ = r.trySend(ctx, outCh, ae)
-				return true, false
-			}
-
-			entry.mu.Lock()
-			entry.state = ev.State
-			entry.mu.Unlock()
-			if !r.trySend(ctx, outCh, ae) {
-				return true, false
+			done, stop := r.onJobEvent(ctx, entry, h, outCh, ev)
+			if stop {
+				return done, false
 			}
 
 		case watchErr, ok := <-errs:
@@ -224,8 +192,68 @@ func (r *runtimeImpl) consumeWatch(ctx context.Context, entry *attemptEntry, h A
 	}
 }
 
+// onEventsClosed handles the case where jw.Events is closed.
+// Per JobWatch contract, a terminal error is sent to Errs before Events closes.
+func (r *runtimeImpl) onEventsClosed(
+	ctx context.Context, entry *attemptEntry, h AttemptHandle,
+	outCh chan<- AttemptEvent, errs <-chan JobWatchError,
+) (done bool, reconnect bool) {
+	if errs != nil {
+		select {
+		case watchErr, hasErr := <-errs:
+			if hasErr {
+				return r.handleWatchErr(ctx, entry, h, outCh, watchErr)
+			}
+		default:
+		}
+	}
+	return true, false
+}
+
+// onJobEvent processes a single JobEvent. Returns (done, stop):
+// stop=true means the caller should return immediately with done.
+func (r *runtimeImpl) onJobEvent(
+	ctx context.Context, entry *attemptEntry, h AttemptHandle,
+	outCh chan<- AttemptEvent, ev JobEvent,
+) (done bool, stop bool) {
+	// Drop backward state transitions.
+	entry.mu.Lock()
+	cur := entry.state
+	entry.mu.Unlock()
+	if stateOrder(ev.State) < stateOrder(cur) {
+		return false, false
+	}
+
+	ae := AttemptEvent{
+		AttemptID: h.AttemptID,
+		State:     ev.State,
+		Reason:    ev.Reason,
+		Message:   ev.Message,
+		Timestamp: ev.Timestamp,
+	}
+
+	if ev.State.IsTerminal() {
+		if entry.transitionToTerminal(ev.State, ev.Reason, ev.Message, ev.Timestamp) {
+			r.decrementActive()
+		}
+		_ = r.trySend(ctx, outCh, ae)
+		return true, true
+	}
+
+	entry.mu.Lock()
+	entry.state = ev.State
+	entry.mu.Unlock()
+	if !r.trySend(ctx, outCh, ae) {
+		return true, true
+	}
+	return false, false
+}
+
 // handleWatchErr processes a single JobWatchError.
-func (r *runtimeImpl) handleWatchErr(ctx context.Context, entry *attemptEntry, h AttemptHandle, outCh chan<- AttemptEvent, watchErr JobWatchError) (done bool, reconnect bool) {
+func (r *runtimeImpl) handleWatchErr(
+	ctx context.Context, entry *attemptEntry, h AttemptHandle,
+	outCh chan<- AttemptEvent, watchErr JobWatchError,
+) (done bool, reconnect bool) {
 	if watchErr.Temporary {
 		return false, true
 	}
