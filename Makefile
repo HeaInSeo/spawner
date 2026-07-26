@@ -21,7 +21,7 @@ PKGS_LIFECYCLE  := ./pkg/actor ./pkg/dispatcher ./cmd/imp
 
 COVERAGE_THRESHOLD := 70
 
-.PHONY: test coverage coverage-check fmt vet lint lint-depguard lint-fix lint-security vuln vuln-all test-race test-lifecycle golangci-lint govulncheck
+.PHONY: test coverage coverage-check fmt vet lint lint-depguard lint-fix lint-security lint-security-check vuln vuln-check vuln-all test-race test-lifecycle golangci-lint govulncheck
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -94,6 +94,10 @@ lint-security: golangci-lint
 	| tee "$(REPORT_DIR)/gosec.txt"; \
 	echo "gosec_exit=$$?" | tee -a "$(REPORT_DIR)/lint-security-summary.txt"
 
+lint-security-check: golangci-lint
+	@mkdir -p "$(REPORT_DIR)" "$(GOCACHE_DIR)" "$(GOTMPDIR)"
+	$(GOENV) $(GOLANGCI_LINT) run --enable-only gosec $(PKGS_SECURITY) | tee "$(REPORT_DIR)/gosec.txt"
+
 # ── Vulnerability scan ────────────────────────────────────────────────────────
 
 vuln: govulncheck
@@ -101,6 +105,10 @@ vuln: govulncheck
 	@set +e; \
 	$(GOENV) $(GOVULNCHECK) $(PKGS_SECURITY) 2>&1 | tee "$(REPORT_DIR)/govulncheck-core.txt"; \
 	echo "govulncheck_core_exit=$$?" | tee "$(REPORT_DIR)/govulncheck-core.summary"
+
+vuln-check: govulncheck
+	@mkdir -p "$(REPORT_DIR)" "$(GOCACHE_DIR)" "$(GOTMPDIR)"
+	$(GOENV) $(GOVULNCHECK) $(PKGS_SECURITY) 2>&1 | tee "$(REPORT_DIR)/govulncheck-core.txt"
 
 vuln-all: govulncheck
 	@mkdir -p "$(REPORT_DIR)" "$(GOCACHE_DIR)" "$(GOTMPDIR)"
