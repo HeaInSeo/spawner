@@ -26,6 +26,32 @@ From the `poc` integration point of view, the most valuable parts of this reposi
 
 The codebase is strong enough for architecture validation, but it is not yet a fully productized execution service.
 
+### Two Job-creation paths — do not confuse them
+
+spawner has two independent ways to create a K8s Job. They look similar but serve
+different callers:
+
+- **`DriverK8s`** (`cmd/imp/k8s_driver.go`), behind the `driver.Driver` interface —
+  used directly by spawner's own standalone entry point (`cmd/server`). This is
+  spawner's reference/PoC implementation, not a production contract. The sibling
+  `poc` repo still references `DriverK8s` in source, but poc's `go.mod` was never
+  updated after spawner's module path changed (`github.com/seoyhaein/spawner` →
+  `github.com/HeaInSeo/spawner`), so poc itself does not currently build. The
+  concrete reason `DriverK8s` is kept rather than deleted is spawner's own
+  `cmd/server` depending on it, not poc's current usage.
+- **`pkg/runtime.JobClient`** — the interface spawner *defines* but does not
+  implement in production. JUMI implements it externally
+  (`JUMI/pkg/spawner/k8s_jobclient.go`) and is wired up in
+  `JUMI/cmd/jumi/main.go`. **This is the path actually used in production.**
+
+JUMI never calls `DriverK8s`. If you're trying to understand "how does a Job
+actually get created in JUMI production," start from `pkg/runtime.JobClient`,
+not `DriverK8s` — see that interface's doc comment in `pkg/runtime/jobclient.go`
+for the full contract. `DriverK8s` should be treated as legacy/reference only and
+not extended with new production-only features intended for the `JobClient`
+contract. (See [issue #1](https://github.com/HeaInSeo/spawner/issues/1) for the
+full background.)
+
 ## Package structure
 
 ```

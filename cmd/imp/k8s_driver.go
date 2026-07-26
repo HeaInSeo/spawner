@@ -33,6 +33,17 @@ type handleJob struct {
 // Kueue integration is optional: if the queue-name label is present, the Job
 // starts suspended so Kueue can admit it; otherwise it starts immediately as a
 // plain Kubernetes Job.
+//
+// Scope: DriverK8s is spawner's own standalone-server / reference implementation
+// path, used directly by cmd/server. The sibling `poc` repo still references
+// DriverK8s in source, but poc's go.mod was never updated after spawner's module
+// path changed (github.com/seoyhaein/spawner -> github.com/HeaInSeo/spawner), so
+// poc itself does not currently build against it. DriverK8s is NOT the path JUMI
+// uses in production. JUMI implements pkg/runtime.JobClient externally
+// (see JUMI/pkg/spawner/k8s_jobclient.go) and never calls into DriverK8s.
+// See pkg/runtime.JobClient's doc comment for the production contract; treat
+// DriverK8s as legacy/reference only and do not extend it with new
+// production-only features intended for the JobClient contract.
 type DriverK8s struct {
 	driver.BaseDriver
 	ns        string
