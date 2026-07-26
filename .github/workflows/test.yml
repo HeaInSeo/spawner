@@ -40,6 +40,12 @@ jobs:
       - name: Run tests
         run: make test
 
+      - name: Run security lint guardrail
+        run: make lint-security-check
+
+      - name: Run vulnerability guardrail
+        run: make vuln-check
+
       - name: Generate coverage report
         run: make coverage
 
