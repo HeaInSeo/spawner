@@ -15,11 +15,30 @@ on:
 permissions:
   contents: read
 
+env:
+  ACTIONLINT_VERSION: v1.7.7
+
 concurrency:
   group: lint-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  actionlint:
+    name: Actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Validate GitHub Actions workflows
+        run: go run "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+
   lint:
     name: Lint (Run on Ubuntu)
     runs-on: ubuntu-latest
