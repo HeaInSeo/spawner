@@ -36,6 +36,7 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code
+          test -z "$(git status --porcelain -- go.mod go.sum)"
 
       - name: Run tests
         run: make test
