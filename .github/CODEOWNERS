@@ -1,0 +1,9 @@
+# Default owner for every path.
+* @HeaInSeo
+
+# Security and supply-chain policy.
+/go.mod @HeaInSeo
+/go.sum @HeaInSeo
+
+# Deployment and automation guardrails.
+/.github/ @HeaInSeo
