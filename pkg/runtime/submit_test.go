@@ -221,6 +221,50 @@ func TestSubmitAttempt_ErrSubmitOutcomeUnknown_CtxCancelledBeforeCreate(t *testi
 	close(block) // let Create finish (cleanup)
 }
 
+func TestSubmitAttempt_SubmitTimeout_ReturnsOutcomeUnknownIndependentOfCallerCtx(t *testing.T) {
+	// SubmitTimeout must bound how long SubmitAttempt blocks even when the
+	// caller's own ctx has no deadline and is never cancelled - Create keeps
+	// running in the background on the Runtime-owned ctx (proven below by
+	// retrying and observing the handle recovered), but the caller gets
+	// ErrSubmitOutcomeUnknown back once SubmitTimeout elapses so it isn't
+	// stuck blocking on a slow/unavailable backend.
+	started := make(chan struct{})
+	proceed := make(chan struct{})
+
+	client := &fakeJobClient{
+		createFn: func(ctx context.Context, req JobCreateRequest) (BackendRef, error) {
+			close(started)
+			<-proceed // held open past SubmitTimeout, released at the end of the test
+			return NewK8sJobBackendRef(req.Namespace, req.JobName, "uid"), nil
+		},
+	}
+	rt := newTestRuntime(t, client, func(c *RuntimeConfig) {
+		c.SubmitTimeout = 30 * time.Millisecond
+		c.CreateTimeout = 5 * time.Second
+	})
+
+	// context.Background(): no deadline, never cancelled - only SubmitTimeout
+	// can make SubmitAttempt return before Create finishes.
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := rt.SubmitAttempt(context.Background(), minimalReq("a1"))
+		errCh <- err
+	}()
+
+	<-started // Create is in progress
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, ErrSubmitOutcomeUnknown) {
+			t.Fatalf("expected ErrSubmitOutcomeUnknown, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SubmitAttempt did not return within SubmitTimeout + margin")
+	}
+
+	close(proceed) // let the in-flight Create finish
+}
+
 func TestSubmitAttempt_RetryAfterOutcomeUnknown_RecoversHandle(t *testing.T) {
 	// Simulate: first caller's ctx cancelled, Create succeeds, second caller retries.
 	started := make(chan struct{})

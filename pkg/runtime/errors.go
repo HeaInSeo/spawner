@@ -12,8 +12,9 @@ var (
 	ErrCapacityExceeded = errors.New("runtime: capacity exceeded")
 
 	// ErrSubmitOutcomeUnknown is returned by SubmitAttempt when the caller's ctx
-	// was cancelled after the Runtime accepted the request but before a definitive
-	// result could be returned. The backend job may or may not have been created.
+	// was cancelled, or RuntimeConfig.SubmitTimeout elapsed, after the Runtime
+	// accepted the request but before a definitive result could be returned.
+	// The backend job may or may not have been created.
 	//
 	// JUMI must retry SubmitAttempt with the same AttemptID. The Runtime will
 	// regenerate the same (Namespace, JobName, AttemptMarker) and recover the

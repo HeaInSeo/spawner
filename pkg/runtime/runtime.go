@@ -39,16 +39,19 @@ type Runtime interface {
 	// JUMI should persist it to the execution store before proceeding.
 	//
 	// Once the Runtime actor accepts the request, JobClient.Create is driven
-	// by a Runtime-owned context (not the caller's ctx). If the caller's ctx
-	// is cancelled after Create succeeds but before the handle is returned,
-	// ErrSubmitOutcomeUnknown is returned. JUMI must retry with the same
-	// AttemptID — the Runtime will recover the existing BackendRef via the
-	// deterministic (Namespace, JobName) pair.
+	// by a Runtime-owned context (not the caller's ctx), so SubmitAttempt can
+	// return before Create finishes without aborting it. This happens either
+	// when the caller's ctx is cancelled, or when RuntimeConfig.SubmitTimeout
+	// elapses first — whichever comes first. Either way ErrSubmitOutcomeUnknown
+	// is returned, and JUMI must retry with the same AttemptID — the Runtime
+	// will recover the existing BackendRef via the deterministic
+	// (Namespace, JobName) pair.
 	//
 	// Errors:
 	//   ErrBackendUnavailable    backend temporarily unreachable after bounded retries
 	//   ErrCapacityExceeded      bounded concurrency limit reached
-	//   ErrSubmitOutcomeUnknown  ctx cancelled after possible Create; retry same AttemptID
+	//   ErrSubmitOutcomeUnknown  ctx cancelled, or SubmitTimeout elapsed, after
+	//                            possible Create; retry same AttemptID
 	//   validation error         AttemptRequest.Validate() failed
 	SubmitAttempt(ctx context.Context, req AttemptRequest) (AttemptHandle, error)
 

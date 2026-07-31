@@ -105,10 +105,14 @@ func (r *runtimeImpl) SubmitAttempt(ctx context.Context, req AttemptRequest) (At
 
 	if existing, ok := r.attempts[req.AttemptID]; ok {
 		r.mu.Unlock()
+		submitTimer := time.NewTimer(r.cfg.SubmitTimeout)
+		defer submitTimer.Stop()
 		// Wait for in-flight Create (or return immediately if already done).
 		select {
 		case <-existing.doneCh:
 		case <-ctx.Done():
+			return AttemptHandle{}, ErrSubmitOutcomeUnknown
+		case <-submitTimer.C:
 			return AttemptHandle{}, ErrSubmitOutcomeUnknown
 		}
 		existing.mu.Lock()
@@ -134,6 +138,8 @@ func (r *runtimeImpl) SubmitAttempt(ctx context.Context, req AttemptRequest) (At
 
 	go r.runCreate(entry)
 
+	submitTimer := time.NewTimer(r.cfg.SubmitTimeout)
+	defer submitTimer.Stop()
 	select {
 	case <-entry.doneCh:
 		entry.mu.Lock()
@@ -141,6 +147,8 @@ func (r *runtimeImpl) SubmitAttempt(ctx context.Context, req AttemptRequest) (At
 		entry.mu.Unlock()
 		return handle, err
 	case <-ctx.Done():
+		return AttemptHandle{}, ErrSubmitOutcomeUnknown
+	case <-submitTimer.C:
 		return AttemptHandle{}, ErrSubmitOutcomeUnknown
 	}
 }
