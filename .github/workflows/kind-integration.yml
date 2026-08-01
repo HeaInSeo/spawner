@@ -67,10 +67,24 @@ jobs:
         run: |
           kubectl apply --server-side -f "https://github.com/kubernetes-sigs/kueue/releases/download/${KUEUE_VERSION}/manifests.yaml"
           kubectl wait deploy/kueue-controller-manager -n kueue-system --for=condition=Available --timeout=180s
+          # The Deployment's Available condition can flip true slightly
+          # before the webhook Service's Endpoints have propagated and its
+          # listener actually accepts connections, so an apply immediately
+          # after this can hit "connection refused" on the mutating
+          # webhook. Poll the webhook Service's endpoints directly rather
+          # than a fixed sleep.
+          for i in $(seq 1 30); do
+            if kubectl get endpoints kueue-webhook-service -n kueue-system -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null | grep -q .; then
+              echo "kueue-webhook-service has a ready endpoint"
+              break
+            fi
+            echo "waiting for kueue-webhook-service endpoint ($i/30)..."
+            sleep 2
+          done
 
       - name: Create ResourceFlavor/ClusterQueue/LocalQueue
         run: |
-          cat <<'MANIFESTS' | kubectl apply -f -
+          cat > /tmp/kueue-resources.yaml <<'MANIFESTS'
           apiVersion: kueue.x-k8s.io/v1beta1
           kind: ResourceFlavor
           metadata:
@@ -100,6 +114,18 @@ jobs:
           spec:
             clusterQueue: poc-cluster-queue
           MANIFESTS
+          # Defense-in-depth retry: the endpoint-readiness poll in the
+          # previous step should already make this unnecessary, but the
+          # mutating webhook is the one thing in this job that couldn't be
+          # verified locally (no cluster available), so don't let a single
+          # remaining race window fail the whole job.
+          for i in $(seq 1 10); do
+            if kubectl apply -f /tmp/kueue-resources.yaml; then
+              break
+            fi
+            echo "kubectl apply failed (attempt $i/10), retrying in 3s..."
+            sleep 3
+          done
           kubectl wait clusterqueue/poc-cluster-queue --for=condition=Active --timeout=60s
 
       - name: Diagnostics on failure
