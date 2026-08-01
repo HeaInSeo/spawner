@@ -1,0 +1,124 @@
+name: Kind Integration
+
+# Runs the integration-tagged create/watch/cancel lifecycle tests
+# (cmd/imp/k8s_driver_integration_test.go) against a real Kubernetes
+# apiserver + real Kueue admission control, in a kind cluster provisioned
+# fresh for the job. This was spawner's biggest domain-profile gap: the
+# only real-apiserver test existed but was never compiled or run in CI
+# (no `-tags=integration` anywhere in the Makefile/workflows) - everything
+# CI actually ran, including tests literally named "integration", ran
+# against fakes. See https://github.com/HeaInSeo/spawner/issues/8.
+#
+# kind + Kueue both run on the same ubuntu-latest job allocation as
+# everything else - no extra billed runner time beyond this job's own
+# duration, no new infrastructure.
+
+on:
+  push:
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - ".github/**/*.md"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE*"
+      - ".github/**/*.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kind-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+# Pin the Kueue manifest version so a future Kueue release doesn't silently
+# change this job's behavior. This is a first-pass value picked to match
+# the kueue.x-k8s.io/v1beta2 Workload API this repo's code already expects
+# (cmd/imp/k8s_observer.go) - if cluster bring-up or the wait step below
+# fails on a real run, bumping this is the first thing to check, since
+# there was no existing kind/Kueue setup script or manifest anywhere in
+# this repo to copy from (the original "kind-poc" cluster referenced in
+# the integration test's doc comment was set up manually and never
+# captured in version control).
+env:
+  KUEUE_VERSION: v0.13.2
+
+jobs:
+  kind-integration:
+    name: Real apiserver create/watch/cancel (kind + Kueue)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: kind-poc
+
+      - name: Install Kueue
+        run: |
+          kubectl apply --server-side -f "https://github.com/kubernetes-sigs/kueue/releases/download/${KUEUE_VERSION}/manifests.yaml"
+          kubectl wait deploy/kueue-controller-manager -n kueue-system --for=condition=Available --timeout=180s
+
+      - name: Create ResourceFlavor/ClusterQueue/LocalQueue
+        run: |
+          cat <<'MANIFESTS' | kubectl apply -f -
+          apiVersion: kueue.x-k8s.io/v1beta1
+          kind: ResourceFlavor
+          metadata:
+            name: default-flavor
+          ---
+          apiVersion: kueue.x-k8s.io/v1beta1
+          kind: ClusterQueue
+          metadata:
+            name: poc-cluster-queue
+          spec:
+            namespaceSelector: {}
+            resourceGroups:
+              - coveredResources: ["cpu", "memory"]
+                flavors:
+                  - name: default-flavor
+                    resources:
+                      - name: "cpu"
+                        nominalQuota: "4"
+                      - name: "memory"
+                        nominalQuota: "8Gi"
+          ---
+          apiVersion: kueue.x-k8s.io/v1beta1
+          kind: LocalQueue
+          metadata:
+            name: poc-standard-lq
+            namespace: default
+          spec:
+            clusterQueue: poc-cluster-queue
+          MANIFESTS
+          kubectl wait clusterqueue/poc-cluster-queue --for=condition=Active --timeout=60s
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          echo "--- kueue-system pods ---"
+          kubectl get pods -n kueue-system -o wide || true
+          echo "--- kueue-system events ---"
+          kubectl get events -n kueue-system --sort-by=.lastTimestamp || true
+          echo "--- clusterqueue/localqueue status ---"
+          kubectl get clusterqueue,localqueue -A -o yaml || true
+
+      - name: Run kind integration tests
+        run: go test -v -tags=integration -run 'TestDriverK8s_Smoke|TestDriverK8s_Cancel' -timeout 5m ./cmd/imp/
+
+      - name: Diagnostics on test failure
+        if: failure()
+        run: |
+          echo "--- jobs/pods in default namespace ---"
+          kubectl get jobs,pods -n default -o wide || true
+          echo "--- workloads ---"
+          kubectl get workloads.kueue.x-k8s.io -A -o yaml || true
