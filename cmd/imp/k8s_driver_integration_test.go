@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/HeaInSeo/spawner/pkg/api"
 )
 
@@ -107,5 +110,47 @@ func TestDriverK8s_Cancel(t *testing.T) {
 	if err := drv.Cancel(ctx, h); err != nil {
 		t.Fatalf("Cancel: %v", err)
 	}
-	t.Log("Cancel OK — Job deleted")
+	t.Log("Cancel accepted — waiting for background propagation to actually remove the Job and its pods")
+
+	hd, ok := h.(handleJob)
+	if !ok {
+		t.Fatalf("handle type assertion failed: expected handleJob, got %T", h)
+	}
+
+	// Cancel only issues a background-propagation delete: the API server
+	// can accept it while a finalizer blocks removal, or an orphaning-policy
+	// regression could leave pods behind even though the Job itself is
+	// gone. Assert both actually disappear rather than trusting Cancel's
+	// nil error alone.
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		_, err := drv.clientset.BatchV1().Jobs(hd.ns).Get(ctx, hd.name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("get job %s during cancel-propagation poll: %v", hd.name, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job %s was not removed within 60s of Cancel (background propagation stuck or blocked by a finalizer)", hd.name)
+		}
+		time.Sleep(1 * time.Second)
+	}
+	t.Log("Job removed")
+
+	deadline = time.Now().Add(60 * time.Second)
+	for {
+		pods, err := drv.clientset.CoreV1().Pods(hd.ns).List(ctx, metav1.ListOptions{LabelSelector: "job-name=" + hd.name})
+		if err != nil {
+			t.Fatalf("list pods for job %s during cancel-propagation poll: %v", hd.name, err)
+		}
+		if len(pods.Items) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job %s still has %d pod(s) 60s after Cancel — background propagation did not remove them", hd.name, len(pods.Items))
+		}
+		time.Sleep(1 * time.Second)
+	}
+	t.Log("Cancel OK — Job and its pods removed")
 }
