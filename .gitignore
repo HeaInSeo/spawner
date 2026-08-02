@@ -28,3 +28,6 @@ go.work.sum
 # CI/test reports
 reports/
 
+# spec-kit per-feature state (not committed)
+.specify/feature.json
+
