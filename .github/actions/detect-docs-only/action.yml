@@ -1,0 +1,45 @@
+name: Detect docs-only change
+description: >
+  Sets docs_only=true when every changed file is documentation (markdown /
+  LICENSE). Lets a required-check job always RUN and report a status (green for
+  docs-only), instead of the workflow being skipped by on.*.paths-ignore — which
+  leaves the required check permanently "Expected" and blocks docs-only PRs.
+  Requires the calling job to checkout with fetch-depth: 0.
+outputs:
+  docs_only:
+    description: "true if the change touches only docs (markdown/LICENSE)"
+    value: ${{ steps.detect.outputs.docs_only }}
+runs:
+  using: composite
+  steps:
+    - id: detect
+      shell: bash
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+        else
+          base="${{ github.event.before }}"
+          head="${{ github.sha }}"
+        fi
+        # New branch / unknown base (all-zero SHA) → cannot diff → run full checks.
+        if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+          echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          echo "base commit unavailable — running full checks"
+          exit 0
+        fi
+        changed="$(git diff --name-only "$base" "$head")"
+        if [ -z "$changed" ]; then
+          echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          echo "no file delta detected — running full checks"
+          exit 0
+        fi
+        # docs_only unless at least one changed file is NOT markdown/LICENSE.
+        if printf '%s\n' "$changed" | grep -qvE '(\.md$|^LICENSE|^\.github/.*\.md$)'; then
+          echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          echo "non-doc files changed — running checks:"
+          printf '%s\n' "$changed" | grep -vE '(\.md$|^LICENSE|^\.github/.*\.md$)' | sed 's/^/  /'
+        else
+          echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          echo "docs-only change — skipping work, reporting success"
+        fi

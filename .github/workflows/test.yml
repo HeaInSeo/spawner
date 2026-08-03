@@ -1,16 +1,11 @@
 name: Tests
 
+# No paths-ignore: the workflow always triggers so the required check "Run on
+# Ubuntu" always reports a status. Docs-only changes are detected in-job and
+# the work is skipped (green) — see .github/actions/detect-docs-only. (#29)
 on:
   push:
-    paths-ignore:
-      - "**/*.md"
-      - "LICENSE*"
-      - ".github/**/*.md"
   pull_request:
-    paths-ignore:
-      - "**/*.md"
-      - "LICENSE*"
-      - ".github/**/*.md"
 
 permissions:
   contents: read
@@ -26,33 +21,45 @@ jobs:
     steps:
       - name: Clone the code
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect docs-only change
+        id: changes
+        uses: ./.github/actions/detect-docs-only
 
       - name: Setup Go
+        if: steps.changes.outputs.docs_only != 'true'
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
       - name: Verify module state
+        if: steps.changes.outputs.docs_only != 'true'
         run: |
           go mod tidy
           git diff --exit-code
           test -z "$(git status --porcelain -- go.mod go.sum)"
 
       - name: Run tests
+        if: steps.changes.outputs.docs_only != 'true'
         run: make test
 
       - name: Run security lint guardrail
+        if: steps.changes.outputs.docs_only != 'true'
         run: make lint-security-check
 
       - name: Run vulnerability guardrail
+        if: steps.changes.outputs.docs_only != 'true'
         run: make vuln-check
 
       - name: Generate coverage report
+        if: steps.changes.outputs.docs_only != 'true'
         run: make coverage
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v7
-        if: always()
+        if: always() && steps.changes.outputs.docs_only != 'true'
         with:
           name: spawner-coverage
           path: reports/

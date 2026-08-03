@@ -1,16 +1,12 @@
 name: Lint
 
+# No paths-ignore: the workflow always triggers so the required check "Lint
+# (Run on Ubuntu)" always reports a status. Docs-only changes are detected
+# in-job and the work is skipped (green) — see
+# .github/actions/detect-docs-only. (#29)
 on:
   push:
-    paths-ignore:
-      - "**/*.md"
-      - "LICENSE*"
-      - ".github/**/*.md"
   pull_request:
-    paths-ignore:
-      - "**/*.md"
-      - "LICENSE*"
-      - ".github/**/*.md"
 
 permissions:
   contents: read
@@ -30,13 +26,21 @@ jobs:
     steps:
       - name: Clone the code
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect docs-only change
+        id: changes
+        uses: ./.github/actions/detect-docs-only
 
       - name: Setup Go
+        if: steps.changes.outputs.docs_only != 'true'
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
       - name: Validate GitHub Actions workflows
+        if: steps.changes.outputs.docs_only != 'true'
         run: go run "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
 
   lint:
@@ -45,11 +49,19 @@ jobs:
     steps:
       - name: Clone the code
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect docs-only change
+        id: changes
+        uses: ./.github/actions/detect-docs-only
 
       - name: Setup Go
+        if: steps.changes.outputs.docs_only != 'true'
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
       - name: Run lint guardrail
+        if: steps.changes.outputs.docs_only != 'true'
         run: make lint
