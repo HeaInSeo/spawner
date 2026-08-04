@@ -1,3 +1,7 @@
+# NOTE: Byte-copy of HeaInSeo/JUMI/.github/actions/detect-docs-only/action.yml
+# @dac3a46 (the classifier body below is identical across copies). Not a
+# canonical source — consolidation is tracked in NodeVault#87 (D-13 twin).
+# Keep in sync with the other copies until then.
 name: Detect docs-only change
 description: >
   Sets docs_only=true when every changed file is documentation (markdown /
@@ -28,17 +32,24 @@ runs:
           echo "base commit unavailable — running full checks"
           exit 0
         fi
-        changed="$(git diff --name-only "$base" "$head")"
+        # --no-renames: a rename is otherwise reported by its destination only,
+        # so renaming a code file to a *.md path would look docs-only and skip
+        # every check. With --no-renames both the deleted source and the added
+        # destination are listed and classified.
+        changed="$(git diff --no-renames --name-only "$base" "$head")"
         if [ -z "$changed" ]; then
           echo "docs_only=false" >> "$GITHUB_OUTPUT"
           echo "no file delta detected — running full checks"
           exit 0
         fi
         # docs_only unless at least one changed file is NOT markdown/LICENSE.
-        if printf '%s\n' "$changed" | grep -qvE '(\.md$|^LICENSE|^\.github/.*\.md$)'; then
+        # ^LICENSE is anchored so LICENSES/foo.go and LICENSE-notes.go stay code;
+        # only LICENSE and LICENSE.<ext> count as docs. (.github/*.md is already
+        # covered by \.md$.)
+        if printf '%s\n' "$changed" | grep -qvE '(\.md$|^LICENSE(\.[^/]*)?$)'; then
           echo "docs_only=false" >> "$GITHUB_OUTPUT"
           echo "non-doc files changed — running checks:"
-          printf '%s\n' "$changed" | grep -vE '(\.md$|^LICENSE|^\.github/.*\.md$)' | sed 's/^/  /'
+          printf '%s\n' "$changed" | grep -vE '(\.md$|^LICENSE(\.[^/]*)?$)' | sed 's/^/  /'
         else
           echo "docs_only=true" >> "$GITHUB_OUTPUT"
           echo "docs-only change — skipping work, reporting success"
