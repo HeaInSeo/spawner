@@ -3,7 +3,7 @@ name: Lint
 # No paths-ignore: the workflow always triggers so the required check "Lint
 # (Run on Ubuntu)" always reports a status. Docs-only changes are detected
 # in-job and the work is skipped (green) — see
-# .github/actions/detect-docs-only. (#29)
+# HeaInSeo/platform-ci-actions/.github/actions/detect-docs-only. (#29)
 on:
   push:
   pull_request:
@@ -31,7 +31,7 @@ jobs:
 
       - name: Detect docs-only change
         id: changes
-        uses: ./.github/actions/detect-docs-only
+        uses: HeaInSeo/platform-ci-actions/.github/actions/detect-docs-only@62c0d29be4f80824cb767bf184512ce9f624d2ff
 
       - name: Setup Go
         if: steps.changes.outputs.docs_only != 'true'
@@ -54,7 +54,7 @@ jobs:
 
       - name: Detect docs-only change
         id: changes
-        uses: ./.github/actions/detect-docs-only
+        uses: HeaInSeo/platform-ci-actions/.github/actions/detect-docs-only@62c0d29be4f80824cb767bf184512ce9f624d2ff
 
       - name: Setup Go
         if: steps.changes.outputs.docs_only != 'true'
