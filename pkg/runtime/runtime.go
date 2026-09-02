@@ -74,4 +74,19 @@ type Runtime interface {
 	//   - Non-terminal: cancel backend job, emit Cancelled.
 	//   - Already terminal: no-op. Existing terminal outcome is NOT overwritten.
 	CancelAttempt(ctx context.Context, h AttemptHandle) error
+
+	// ResolveIdentity returns the deterministic backend identity for attemptID
+	// WITHOUT creating, submitting, or mutating anything. It is a pure function
+	// of the Runtime's stable NamingSalt/Namespace and derives the identity from
+	// the same single source as SubmitAttempt (so callers never re-implement the
+	// naming/marker formula, and NamingSalt stays encapsulated in the Runtime).
+	//
+	// It exists for restart recovery: when a submission fence was crossed but no
+	// durable backend handle survives, a consumer uses the returned JobName to do
+	// a read-only lookup and compares the found resource's authoritative
+	// full-marker annotation ("jumi.io/attempt-marker") to AttemptMarker for
+	// ownership equality (never a truncated label). It performs no backend I/O itself.
+	//
+	// Errors: validation error if attemptID is empty.
+	ResolveIdentity(attemptID string) (BackendIdentity, error)
 }
