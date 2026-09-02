@@ -2,7 +2,7 @@ module github.com/HeaInSeo/spawner
 
 go 1.25.12
 
-toolchain go1.26.5
+toolchain go1.26.6
 
 require (
 	go.uber.org/goleak v1.3.0

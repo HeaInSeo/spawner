@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -86,6 +87,17 @@ func NewRuntime(client JobClient, cfg RuntimeConfig) (Runtime, error) {
 		ctx:      ctx,
 		cancel:   cancel,
 	}, nil
+}
+
+// ResolveIdentity implements Runtime. It derives the deterministic backend
+// identity from the same single-source naming functions used by SubmitAttempt
+// (jobNameFor/attemptMarkerFor) and performs no backend I/O, no Create, and no
+// mutation. NamingSalt stays encapsulated in the Runtime config.
+func (r *runtimeImpl) ResolveIdentity(attemptID string) (BackendIdentity, error) {
+	if attemptID == "" {
+		return BackendIdentity{}, fmt.Errorf("runtime: ResolveIdentity requires a non-empty attemptID")
+	}
+	return deriveBackendIdentity(r.cfg.NamingSalt, r.cfg.Namespace, attemptID), nil
 }
 
 // SubmitAttempt validates the request, initiates job creation, and blocks until
