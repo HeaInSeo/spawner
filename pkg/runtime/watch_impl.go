@@ -212,18 +212,17 @@ func (r *runtimeImpl) onEventsClosed(
 
 // onJobEvent processes a single JobEvent. Returns (done, stop):
 // stop=true means the caller should return immediately with done.
+//
+// AttemptTimeout and CancelAttempt end an attempt concurrently with this
+// loop, and consumeWatch's select may pick a queued backend event over the
+// already-closed terminalCh. Once the attempt is terminal, watchers must see
+// the recorded outcome, never a late backend state: a late terminal event lost
+// the race and is not reported, and a late non-terminal event must not move
+// the stored state back out of terminal.
 func (r *runtimeImpl) onJobEvent(
 	ctx context.Context, entry *attemptEntry, h AttemptHandle,
 	outCh chan<- AttemptEvent, ev JobEvent,
 ) (done bool, stop bool) {
-	// Drop backward state transitions.
-	entry.mu.Lock()
-	cur := entry.state
-	entry.mu.Unlock()
-	if stateOrder(ev.State) < stateOrder(cur) {
-		return false, false
-	}
-
 	ae := AttemptEvent{
 		AttemptID: h.AttemptID,
 		State:     ev.State,
@@ -233,14 +232,29 @@ func (r *runtimeImpl) onJobEvent(
 	}
 
 	if ev.State.IsTerminal() {
-		if entry.transitionToTerminal(ev.State, ev.Reason, ev.Message, ev.Timestamp) {
-			r.decrementActive()
+		if !entry.transitionToTerminal(ev.State, ev.Reason, ev.Message, ev.Timestamp) {
+			r.emitTerminal(ctx, entry, h, outCh)
+			return true, true
 		}
+		r.decrementActive()
 		_ = r.trySend(ctx, outCh, ae)
 		return true, true
 	}
 
+	// Check and apply the transition under one lock, so a terminal transition
+	// that lands in between cannot be overwritten.
 	entry.mu.Lock()
+	cur := entry.state
+	if cur.IsTerminal() {
+		entry.mu.Unlock()
+		r.emitTerminal(ctx, entry, h, outCh)
+		return true, true
+	}
+	if stateOrder(ev.State) < stateOrder(cur) {
+		// Drop backward state transitions.
+		entry.mu.Unlock()
+		return false, false
+	}
 	entry.state = ev.State
 	entry.mu.Unlock()
 	if !r.trySend(ctx, outCh, ae) {
