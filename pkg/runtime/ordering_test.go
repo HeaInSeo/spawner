@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -25,15 +26,32 @@ func waitUntil(t *testing.T, d time.Duration, what string, cond func() bool) {
 	}
 }
 
+// lateBackendInput is what the backend delivers after the Runtime has already
+// ended the attempt: a queued event, a watch error, or a closed event stream.
+type lateBackendInput func(events chan JobEvent, errs chan JobWatchError)
+
+func lateSucceeded(events chan JobEvent, _ chan JobWatchError) {
+	events <- JobEvent{State: AttemptStateSucceeded, Timestamp: time.Now()}
+}
+
+func lateWatchErr(_ chan JobEvent, errs chan JobWatchError) {
+	errs <- JobWatchError{Reason: "watch-gone", Message: "watch stream failed"}
+}
+
+func lateStreamClose(events chan JobEvent, _ chan JobWatchError) {
+	close(events)
+}
+
 // runLateBackendTerminal ends an attempt through the Runtime (AttemptTimeout
 // when end is nil, otherwise end) while the watch loop is blocked delivering
-// to a full event channel, then queues a backend Succeeded behind it. When the
-// loop resumes, both the closed terminalCh and the queued backend event are
-// ready, so its select may pick either one. Whichever it picks, the watcher
-// must see exactly one terminal event, carrying the recorded outcome.
+// to a full event channel, then applies late behind it. When the loop
+// resumes, both the closed terminalCh and the late backend input are ready, so
+// its select may pick either one. Whichever it picks, the watcher must see
+// exactly one terminal event, last, carrying the recorded outcome.
 func runLateBackendTerminal(
 	t *testing.T, attemptID string, attemptTimeout time.Duration,
-	end func(*runtimeImpl, AttemptHandle), wantState AttemptState, wantReason string,
+	end func(*runtimeImpl, AttemptHandle), late lateBackendInput,
+	wantState AttemptState, wantReason string,
 ) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -45,10 +63,11 @@ func runLateBackendTerminal(
 	for i := 0; i < 16; i++ {
 		events <- JobEvent{State: AttemptStateRunning, Timestamp: time.Now()}
 	}
+	errs := make(chan JobWatchError, 1)
 	deleted := make(chan struct{}, 1)
 	client := &fakeJobClient{
 		watchFn: func(context.Context, BackendRef) (JobWatch, error) {
-			return JobWatch{Events: events, Errs: make(chan JobWatchError)}, nil
+			return JobWatch{Events: events, Errs: errs}, nil
 		},
 		deleteFn: func(context.Context, BackendRef) error {
 			select {
@@ -79,8 +98,19 @@ func runLateBackendTerminal(
 	} else {
 		end(rt, h)
 	}
-	events <- JobEvent{State: AttemptStateSucceeded, Timestamp: time.Now()}
+	late(events, errs)
 
+	assertRecordedTerminal(t, ctx, rt, attemptID, out, wantState, wantReason)
+}
+
+// assertRecordedTerminal drains out and checks the watcher saw Submitted first
+// and exactly one terminal event, last, equal to the stored outcome, and that
+// the attempt was counted out of active exactly once.
+func assertRecordedTerminal(
+	t *testing.T, ctx context.Context, rt *runtimeImpl, attemptID string,
+	out <-chan AttemptEvent, wantState AttemptState, wantReason string,
+) {
+	t.Helper()
 	evs := collectEvents(ctx, out)
 	if ctx.Err() != nil {
 		t.Fatalf("event channel did not close: %v", evs)
@@ -111,33 +141,133 @@ func runLateBackendTerminal(
 	active := rt.active
 	rt.mu.RUnlock()
 	entry.mu.Lock()
-	stored := entry.state
+	stored, storedReason := entry.state, entry.terminalReason
 	entry.mu.Unlock()
-	if stored != wantState {
-		t.Fatalf("stored state = %s, want %s", stored, wantState)
+	if stored != wantState || storedReason != wantReason {
+		t.Fatalf("stored outcome = (%s, %q), want (%s, %q)", stored, storedReason, wantState, wantReason)
 	}
 	if active != 0 {
 		t.Fatalf("active = %d, want 0", active)
 	}
 }
 
-func TestWatch_LateBackendTerminalAfterAttemptTimeout_ReportsDeadlineExceeded(t *testing.T) {
-	for i := 0; i < 20; i++ {
-		runLateBackendTerminal(t, fmt.Sprintf("timeout-%d", i), 200*time.Millisecond,
-			nil, AttemptStateFailed, ReasonDeadlineExceeded)
-	}
-}
-
-func TestWatch_LateBackendTerminalAfterCancel_ReportsCancelled(t *testing.T) {
-	cancelAttempt := func(rt *runtimeImpl, h AttemptHandle) {
+func cancelAttemptFn(t *testing.T) func(*runtimeImpl, AttemptHandle) {
+	return func(rt *runtimeImpl, h AttemptHandle) {
 		if err := rt.CancelAttempt(context.Background(), h); err != nil {
 			t.Fatalf("CancelAttempt: %v", err)
 		}
 	}
+}
+
+func TestWatch_LateBackendTerminalAfterAttemptTimeout_ReportsDeadlineExceeded(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		runLateBackendTerminal(t, fmt.Sprintf("timeout-%d", i), 200*time.Millisecond,
+			nil, lateSucceeded, AttemptStateFailed, ReasonDeadlineExceeded)
+	}
+}
+
+func TestWatch_LateBackendTerminalAfterCancel_ReportsCancelled(t *testing.T) {
 	for i := 0; i < 40; i++ {
 		runLateBackendTerminal(t, fmt.Sprintf("cancel-%d", i), 0,
-			cancelAttempt, AttemptStateCancelled, ReasonUserCancel)
+			cancelAttemptFn(t), lateSucceeded, AttemptStateCancelled, ReasonUserCancel)
 	}
+}
+
+// The error and close exits of the watch loop must honor the recorded
+// terminal the same way: a late permanent watch error must not replace it with
+// a generic Failed, and a stream close must not end the watch without it.
+
+func TestWatch_LateWatchErrAfterAttemptTimeout_ReportsDeadlineExceeded(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		runLateBackendTerminal(t, fmt.Sprintf("timeout-err-%d", i), 200*time.Millisecond,
+			nil, lateWatchErr, AttemptStateFailed, ReasonDeadlineExceeded)
+	}
+}
+
+func TestWatch_LateWatchErrAfterCancel_ReportsCancelled(t *testing.T) {
+	for i := 0; i < 40; i++ {
+		runLateBackendTerminal(t, fmt.Sprintf("cancel-err-%d", i), 0,
+			cancelAttemptFn(t), lateWatchErr, AttemptStateCancelled, ReasonUserCancel)
+	}
+}
+
+func TestWatch_StreamCloseAfterAttemptTimeout_ReportsDeadlineExceeded(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		runLateBackendTerminal(t, fmt.Sprintf("timeout-close-%d", i), 200*time.Millisecond,
+			nil, lateStreamClose, AttemptStateFailed, ReasonDeadlineExceeded)
+	}
+}
+
+func TestWatch_StreamCloseAfterCancel_ReportsCancelled(t *testing.T) {
+	for i := 0; i < 40; i++ {
+		runLateBackendTerminal(t, fmt.Sprintf("cancel-close-%d", i), 0,
+			cancelAttemptFn(t), lateStreamClose, AttemptStateCancelled, ReasonUserCancel)
+	}
+}
+
+// runWatchOpenFailsAfterEnd ends the attempt while JobClient.Watch is still
+// opening the stream, then fails that Watch call. The loop's Watch() error
+// exit must report the recorded terminal rather than ending without one.
+func runWatchOpenFailsAfterEnd(
+	t *testing.T, attemptID string, attemptTimeout time.Duration,
+	end func(*runtimeImpl, AttemptHandle), wantState AttemptState, wantReason string,
+) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	opening := make(chan struct{})
+	release := make(chan struct{})
+	deleted := make(chan struct{}, 1)
+	client := &fakeJobClient{
+		watchFn: func(wctx context.Context, _ BackendRef) (JobWatch, error) {
+			close(opening)
+			select {
+			case <-release:
+			case <-wctx.Done():
+			}
+			return JobWatch{}, errors.New("watch open failed")
+		},
+		deleteFn: func(context.Context, BackendRef) error {
+			select {
+			case deleted <- struct{}{}:
+			default:
+			}
+			return nil
+		},
+	}
+	rt := newTestRuntime(t, client)
+
+	req := minimalReq(attemptID)
+	req.AttemptTimeout = attemptTimeout
+	h, err := rt.SubmitAttempt(ctx, req)
+	if err != nil {
+		t.Fatalf("SubmitAttempt: %v", err)
+	}
+	out, err := rt.WatchAttempt(ctx, h)
+	if err != nil {
+		t.Fatalf("WatchAttempt: %v", err)
+	}
+	waitFor(t, opening, 5*time.Second, "watch loop to call JobClient.Watch")
+
+	if end == nil {
+		waitFor(t, deleted, 5*time.Second, "AttemptTimeout cleanup Delete")
+	} else {
+		end(rt, h)
+	}
+	close(release)
+
+	assertRecordedTerminal(t, ctx, rt, attemptID, out, wantState, wantReason)
+}
+
+func TestWatch_WatchOpenErrAfterAttemptTimeout_ReportsDeadlineExceeded(t *testing.T) {
+	runWatchOpenFailsAfterEnd(t, "timeout-open", 100*time.Millisecond,
+		nil, AttemptStateFailed, ReasonDeadlineExceeded)
+}
+
+func TestWatch_WatchOpenErrAfterCancel_ReportsCancelled(t *testing.T) {
+	runWatchOpenFailsAfterEnd(t, "cancel-open", 0,
+		cancelAttemptFn(t), AttemptStateCancelled, ReasonUserCancel)
 }
 
 // TestWatch_EarlyBackendTerminalStopsAttemptTimeout proves an attempt that
