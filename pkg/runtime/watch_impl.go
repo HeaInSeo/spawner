@@ -114,15 +114,7 @@ func (r *runtimeImpl) watchLoop(
 	for {
 		jw, err := r.client.Watch(ctx, h.BackendRef)
 		if err != nil {
-			if entry.transitionToTerminal(AttemptStateFailed, "", err.Error(), time.Now()) {
-				r.decrementActive()
-				_ = r.trySend(ctx, outCh, AttemptEvent{
-					AttemptID: h.AttemptID,
-					State:     AttemptStateFailed,
-					Message:   err.Error(),
-					Timestamp: time.Now(),
-				})
-			}
+			r.failOrEmitRecorded(ctx, entry, h, outCh, "", err.Error())
 			return
 		}
 
@@ -194,6 +186,8 @@ func (r *runtimeImpl) consumeWatch(
 
 // onEventsClosed handles the case where jw.Events is closed.
 // Per JobWatch contract, a terminal error is sent to Errs before Events closes.
+// If the attempt already ended through AttemptTimeout or CancelAttempt, the
+// recorded terminal is emitted so the watch never ends without it.
 func (r *runtimeImpl) onEventsClosed(
 	ctx context.Context, entry *attemptEntry, h AttemptHandle,
 	outCh chan<- AttemptEvent, errs <-chan JobWatchError,
@@ -207,23 +201,27 @@ func (r *runtimeImpl) onEventsClosed(
 		default:
 		}
 	}
+	select {
+	case <-entry.terminalCh:
+		r.emitTerminal(ctx, entry, h, outCh)
+	default:
+	}
 	return true, false
 }
 
 // onJobEvent processes a single JobEvent. Returns (done, stop):
 // stop=true means the caller should return immediately with done.
+//
+// AttemptTimeout and CancelAttempt end an attempt concurrently with this
+// loop, and consumeWatch's select may pick a queued backend event over the
+// already-closed terminalCh. Once the attempt is terminal, watchers must see
+// the recorded outcome, never a late backend state: a late terminal event lost
+// the race and is not reported, and a late non-terminal event must not move
+// the stored state back out of terminal.
 func (r *runtimeImpl) onJobEvent(
 	ctx context.Context, entry *attemptEntry, h AttemptHandle,
 	outCh chan<- AttemptEvent, ev JobEvent,
 ) (done bool, stop bool) {
-	// Drop backward state transitions.
-	entry.mu.Lock()
-	cur := entry.state
-	entry.mu.Unlock()
-	if stateOrder(ev.State) < stateOrder(cur) {
-		return false, false
-	}
-
 	ae := AttemptEvent{
 		AttemptID: h.AttemptID,
 		State:     ev.State,
@@ -233,14 +231,29 @@ func (r *runtimeImpl) onJobEvent(
 	}
 
 	if ev.State.IsTerminal() {
-		if entry.transitionToTerminal(ev.State, ev.Reason, ev.Message, ev.Timestamp) {
-			r.decrementActive()
+		if !entry.transitionToTerminal(ev.State, ev.Reason, ev.Message, ev.Timestamp) {
+			r.emitTerminal(ctx, entry, h, outCh)
+			return true, true
 		}
+		r.decrementActive()
 		_ = r.trySend(ctx, outCh, ae)
 		return true, true
 	}
 
+	// Check and apply the transition under one lock, so a terminal transition
+	// that lands in between cannot be overwritten.
 	entry.mu.Lock()
+	cur := entry.state
+	if cur.IsTerminal() {
+		entry.mu.Unlock()
+		r.emitTerminal(ctx, entry, h, outCh)
+		return true, true
+	}
+	if stateOrder(ev.State) < stateOrder(cur) {
+		// Drop backward state transitions.
+		entry.mu.Unlock()
+		return false, false
+	}
 	entry.state = ev.State
 	entry.mu.Unlock()
 	if !r.trySend(ctx, outCh, ae) {
@@ -257,17 +270,22 @@ func (r *runtimeImpl) handleWatchErr(
 	if watchErr.Temporary {
 		return false, true
 	}
-	if entry.transitionToTerminal(AttemptStateFailed, watchErr.Reason, watchErr.Message, time.Now()) {
+	r.failOrEmitRecorded(ctx, entry, h, outCh, watchErr.Reason, watchErr.Message)
+	return true, false
+}
+
+// failOrEmitRecorded ends the watch on a permanent watch error. If the error
+// wins the terminal transition, the attempt becomes Failed and leaves active;
+// if AttemptTimeout or CancelAttempt already ended it, the error is not
+// reported. Either way the watcher receives the recorded terminal, once.
+func (r *runtimeImpl) failOrEmitRecorded(
+	ctx context.Context, entry *attemptEntry, h AttemptHandle,
+	outCh chan<- AttemptEvent, reason, msg string,
+) {
+	if entry.transitionToTerminal(AttemptStateFailed, reason, msg, time.Now()) {
 		r.decrementActive()
 	}
-	_ = r.trySend(ctx, outCh, AttemptEvent{
-		AttemptID: h.AttemptID,
-		State:     AttemptStateFailed,
-		Reason:    watchErr.Reason,
-		Message:   watchErr.Message,
-		Timestamp: time.Now(),
-	})
-	return true, false
+	r.emitTerminal(ctx, entry, h, outCh)
 }
 
 // watchRecovery handles WatchAttempt for attempts not found in memory.
