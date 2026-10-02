@@ -188,6 +188,13 @@ func (r *runtimeImpl) consumeWatch(
 // Per JobWatch contract, a terminal error is sent to Errs before Events closes.
 // If the attempt already ended through AttemptTimeout or CancelAttempt, the
 // recorded terminal is emitted so the watch never ends without it.
+//
+// A bare close (no pending error) of a still-live attempt proves nothing about
+// terminality: a Kubernetes watch stream simply ends. It is treated as a
+// temporary watch-disconnected and the same BackendRef is watched again after
+// the existing backoff (spawner #18). No terminal is synthesized, active is not
+// decremented and no replacement attempt is opened; AttemptTimeout,
+// CancelAttempt and ctx keep ownership of termination.
 func (r *runtimeImpl) onEventsClosed(
 	ctx context.Context, entry *attemptEntry, h AttemptHandle,
 	outCh chan<- AttemptEvent, errs <-chan JobWatchError,
@@ -204,9 +211,13 @@ func (r *runtimeImpl) onEventsClosed(
 	select {
 	case <-entry.terminalCh:
 		r.emitTerminal(ctx, entry, h, outCh)
+		return true, false
 	default:
 	}
-	return true, false
+	if ctx.Err() != nil {
+		return true, false
+	}
+	return false, true
 }
 
 // onJobEvent processes a single JobEvent. Returns (done, stop):
