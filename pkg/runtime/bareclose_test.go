@@ -174,6 +174,53 @@ func TestWatch_BareCloseThenContextCancel_NoSyntheticTerminal(t *testing.T) {
 	})
 	cancel()
 
+	assertLiveAfterCtxCancel(t, rt, "bare-close-ctx", out)
+	client.assertSameBackendRef(t, h.BackendRef, 2)
+}
+
+// (4b) The caller cancels while a reconnect Watch is still opening its stream,
+// and the client returns ctx.Err(): a watcher shutdown, not a watch failure.
+// The watcher closes without a terminal and the attempt stays live and active.
+func TestWatch_ReconnectWatchReturnsCtxErr_NoFailure(t *testing.T) {
+	client := newBareCloseClient() // first watch: a bare close
+	reconnecting := make(chan struct{})
+	bareCloseWatch := client.watchFn
+	client.watchFn = func(ctx context.Context, ref BackendRef) (JobWatch, error) {
+		if len(client.watchRefs()) == 0 {
+			return bareCloseWatch(ctx, ref)
+		}
+		client.mu.Lock()
+		client.refs = append(client.refs, ref)
+		client.mu.Unlock()
+		close(reconnecting)
+		<-ctx.Done()
+		return JobWatch{}, ctx.Err()
+	}
+	rt := newTestRuntime(t, client)
+	h, err := rt.SubmitAttempt(context.Background(), minimalReq("reconnect-ctx-err"))
+	if err != nil {
+		t.Fatalf("SubmitAttempt: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	out, err := rt.WatchAttempt(ctx, h)
+	if err != nil {
+		t.Fatalf("WatchAttempt: %v", err)
+	}
+	select {
+	case <-reconnecting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no reconnect Watch after a bare close")
+	}
+	cancel()
+
+	assertLiveAfterCtxCancel(t, rt, "reconnect-ctx-err", out)
+	client.assertSameBackendRef(t, h.BackendRef, 2)
+}
+
+// assertLiveAfterCtxCancel checks that a watcher whose ctx was cancelled closes
+// with no terminal event and leaves the attempt live and counted active.
+func assertLiveAfterCtxCancel(t *testing.T, rt *runtimeImpl, attemptID string, out <-chan AttemptEvent) {
+	t.Helper()
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer drainCancel()
 	evs := collectEvents(drainCtx, out)
@@ -186,7 +233,7 @@ func TestWatch_BareCloseThenContextCancel_NoSyntheticTerminal(t *testing.T) {
 		}
 	}
 	rt.mu.RLock()
-	entry := rt.attempts["bare-close-ctx"]
+	entry := rt.attempts[attemptID]
 	active := rt.active
 	rt.mu.RUnlock()
 	entry.mu.Lock()
@@ -198,7 +245,6 @@ func TestWatch_BareCloseThenContextCancel_NoSyntheticTerminal(t *testing.T) {
 	if active != 1 {
 		t.Fatalf("active = %d, want 1 (no decrement without a terminal)", active)
 	}
-	client.assertSameBackendRef(t, h.BackendRef, 2)
 }
 
 // (5) Many attempts with interleaved bare closes: every attempt ends with one

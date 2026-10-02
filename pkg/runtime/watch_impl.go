@@ -114,6 +114,12 @@ func (r *runtimeImpl) watchLoop(
 	for {
 		jw, err := r.client.Watch(ctx, h.BackendRef)
 		if err != nil {
+			if ctx.Err() != nil {
+				// The caller cancelled WatchAttempt (e.g. while a reconnect was
+				// opening its stream): a watcher shutdown, not an attempt failure.
+				// The attempt stays live and counted active.
+				return
+			}
 			r.failOrEmitRecorded(ctx, entry, h, outCh, "", err.Error())
 			return
 		}
